@@ -11,6 +11,28 @@ using System.Text.RegularExpressions;
 
 namespace DatabaseValueSearcher
 {
+    public class MatchingRecord
+    {
+        public string ColumnName { get; set; } = string.Empty;
+        public string MatchingValue { get; set; } = string.Empty;
+        public Dictionary<string, string> PrimaryKeyValues { get; set; } = new Dictionary<string, string>();
+    }
+
+    public class TableViewInfo
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Type { get; set; } = string.Empty; // T = Table, V = View
+        public long RowCount { get; set; }
+    }
+
+    public class ColumnInfo
+    {
+        public string Name { get; set; } = string.Empty;
+        public string DataType { get; set; } = string.Empty;
+        public int MaxLength { get; set; }
+        public bool IsNullable { get; set; }
+    }
+
     class Program
     {
         private static Dictionary<string, string> environments = new Dictionary<string, string>();
@@ -82,7 +104,10 @@ namespace DatabaseValueSearcher
                 {
                     foreach (string key in envSection.AllKeys)
                     {
-                        environments[key] = envSection[key] ?? key;
+                        if (key != null)
+                        {
+                            environments[key] = envSection[key] ?? key;
+                        }
                     }
                 }
 
@@ -709,6 +734,43 @@ namespace DatabaseValueSearcher
             return builder.ConnectionString;
         }
 
+        static List<string> GetPrimaryKeyColumns(SqlConnection conn, string tableName)
+        {
+            var primaryKeys = new List<string>();
+
+            string sql = @"
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+                  AND TABLE_NAME = @TableName
+                ORDER BY ORDINAL_POSITION";
+
+            try
+            {
+                using (var cmd = new SqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@TableName", tableName);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            string columnName = reader["COLUMN_NAME"]?.ToString() ?? "";
+                            if (!string.IsNullOrEmpty(columnName))
+                            {
+                                primaryKeys.Add(columnName);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteWarning($"Could not retrieve primary key information: {ex.Message}");
+            }
+
+            return primaryKeys;
+        }
+
         static void SearchTable(string environment, string database, string tableName, string searchValue, bool useRegexFromCmdLine = false)
         {
             // Parse search value for regex
@@ -784,7 +846,7 @@ namespace DatabaseValueSearcher
                         var columnTime = Stopwatch.StartNew();
 
                         int matchCount = 0;
-                        List<MatchingRecord> columnMatches = new List<MatchingRecord>();
+                        var columnMatches = new List<MatchingRecord>();
 
                         try
                         {
@@ -845,7 +907,8 @@ namespace DatabaseValueSearcher
                                 {
                                     WriteColoredInline(" | ", ConsoleColor.Gray);
                                     WriteColoredInline("Keys: ", ConsoleColor.Magenta);
-                                    Console.Write(string.Join(", ", match.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}")));
+                                    var keyPairs = match.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}");
+                                    Console.Write(string.Join(", ", keyPairs));
                                 }
                                 Console.WriteLine();
                             }
@@ -902,7 +965,8 @@ namespace DatabaseValueSearcher
                             WriteColoredInline("  Record: ", ConsoleColor.Green);
                             if (record.PrimaryKeyValues.Count > 0)
                             {
-                                Console.WriteLine(string.Join(", ", record.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}")));
+                                var keyPairs = record.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}");
+                                Console.WriteLine(string.Join(", ", keyPairs));
                                 WriteColoredInline("    Found in: ", ConsoleColor.Cyan);
                                 WriteColoredInline($"{record.ColumnName}", ConsoleColor.White);
                                 WriteColoredInline($" = '{record.MatchingValue}'", ConsoleColor.Yellow);
@@ -957,84 +1021,6 @@ namespace DatabaseValueSearcher
                 }
                 WriteWarning("Search failed, but you can try again with different parameters.");
             }
-        }
-
-        static void ShowUsage()
-        {
-            WriteInfo("Database Value Searcher - Usage:");
-            Console.WriteLine("");
-            WriteHighlight("Interactive Mode (Recommended):");
-            Console.WriteLine("  DatabaseValueSearcher.exe");
-            Console.WriteLine("  - Guides you through environment, database, and table selection");
-            Console.WriteLine("  - Shows available tables and views with row counts");
-            Console.WriteLine("  - Provides search pattern examples and tips");
-            Console.WriteLine("  - Supports navigation (back/quit commands)");
-            Console.WriteLine("");
-            WriteHighlight("Command Line Mode:");
-            Console.WriteLine("  DatabaseValueSearcher.exe <environment> <database> <table_name> <search_value> [--regex]");
-            Console.WriteLine("");
-            WriteInfo("Available Environments:");
-            foreach (var env in environments)
-            {
-                Console.WriteLine($"  {env.Key} - {env.Value}");
-            }
-            Console.WriteLine("");
-            WriteHighlight("Search Pattern Examples:");
-            WriteInfo("LIKE Patterns:");
-            Console.WriteLine("  %john%        - Contains 'john' anywhere");
-            Console.WriteLine("  john%         - Starts with 'john'");
-            Console.WriteLine("  %john         - Ends with 'john'");
-            Console.WriteLine("  john          - Exact match");
-            Console.WriteLine("  j_hn          - 'j' + any single character + 'hn'");
-            Console.WriteLine("");
-            WriteInfo("Regular Expression Patterns:");
-            Console.WriteLine("  ^john$        - Exact match for 'john'");
-            Console.WriteLine("  john.*        - Starts with 'john'");
-            Console.WriteLine("  .*john.*      - Contains 'john' anywhere");
-            Console.WriteLine("  \\d{3}-\\d{3}-\\d{4} - Phone number pattern");
-            Console.WriteLine("  [a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,} - Email pattern");
-            Console.WriteLine("");
-            WriteHighlight("Examples:");
-            Console.WriteLine("  DatabaseValueSearcher.exe");
-            Console.WriteLine("  DatabaseValueSearcher.exe Local MyDatabase Users \"%john%\"");
-            Console.WriteLine("  DatabaseValueSearcher.exe QA OrdersDB OrderView \"\\d{5}\" --regex");
-        }
-
-        static List<string> GetPrimaryKeyColumns(SqlConnection conn, string tableName)
-        {
-            var primaryKeys = new List<string>();
-
-            string sql = @"
-                SELECT COLUMN_NAME
-                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
-                  AND TABLE_NAME = @TableName
-                ORDER BY ORDINAL_POSITION";
-
-            try
-            {
-                using (var cmd = new SqlCommand(sql, conn))
-                {
-                    cmd.Parameters.AddWithValue("@TableName", tableName);
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            string columnName = reader["COLUMN_NAME"]?.ToString() ?? "";
-                            if (!string.IsNullOrEmpty(columnName))
-                            {
-                                primaryKeys.Add(columnName);
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteWarning($"Could not retrieve primary key information: {ex.Message}");
-            }
-
-            return primaryKeys;
         }
 
         static List<MatchingRecord> SearchColumnWithKeys(SqlConnection conn, string tableName, string columnName, string searchValue, List<string> primaryKeys)
@@ -1128,6 +1114,50 @@ namespace DatabaseValueSearcher
 
             return matches;
         }
+
+        static void ShowUsage()
+        {
+            WriteInfo("Database Value Searcher - Usage:");
+            Console.WriteLine("");
+            WriteHighlight("Interactive Mode (Recommended):");
+            Console.WriteLine("  DatabaseValueSearcher.exe");
+            Console.WriteLine("  - Guides you through environment, database, and table selection");
+            Console.WriteLine("  - Shows available tables and views with row counts");
+            Console.WriteLine("  - Provides search pattern examples and tips");
+            Console.WriteLine("  - Supports navigation (back/quit commands)");
+            Console.WriteLine("  - Shows primary keys with matching records");
+            Console.WriteLine("");
+            WriteHighlight("Command Line Mode:");
+            Console.WriteLine("  DatabaseValueSearcher.exe <environment> <database> <table_name> <search_value> [--regex]");
+            Console.WriteLine("");
+            WriteInfo("Available Environments:");
+            foreach (var env in environments)
+            {
+                Console.WriteLine($"  {env.Key} - {env.Value}");
+            }
+            Console.WriteLine("");
+            WriteHighlight("Search Pattern Examples:");
+            WriteInfo("LIKE Patterns:");
+            Console.WriteLine("  %john%        - Contains 'john' anywhere");
+            Console.WriteLine("  john%         - Starts with 'john'");
+            Console.WriteLine("  %john         - Ends with 'john'");
+            Console.WriteLine("  john          - Exact match");
+            Console.WriteLine("  j_hn          - 'j' + any single character + 'hn'");
+            Console.WriteLine("");
+            WriteInfo("Regular Expression Patterns:");
+            Console.WriteLine("  ^john$        - Exact match for 'john'");
+            Console.WriteLine("  john.*        - Starts with 'john'");
+            Console.WriteLine("  .*john.*      - Contains 'john' anywhere");
+            Console.WriteLine("  \\d{3}-\\d{3}-\\d{4} - Phone number pattern");
+            Console.WriteLine("  [a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,} - Email pattern");
+            Console.WriteLine("");
+            WriteHighlight("Examples:");
+            Console.WriteLine("  DatabaseValueSearcher.exe");
+            Console.WriteLine("  DatabaseValueSearcher.exe Local MyDatabase Users \"%john%\"");
+            Console.WriteLine("  DatabaseValueSearcher.exe QA OrdersDB OrderView \"\\d{5}\" --regex");
+        }
+
+        static string GetLengthDisplay(int maxLength)
         {
             if (maxLength == -1) return "MAX";
             if (maxLength == 0) return "?";
@@ -1183,146 +1213,5 @@ namespace DatabaseValueSearcher
 
             return columns;
         }
-
-        static int SearchColumn(SqlConnection conn, string tableName, string columnName, string searchValue)
-        {
-            string sql = $"SELECT COUNT(*) FROM [{tableName}] WHERE [{columnName}] LIKE @SearchValue";
-            using (var cmd = new SqlCommand(sql, conn))
-            {
-                cmd.Parameters.AddWithValue("@SearchValue", searchValue);
-                return Convert.ToInt32(cmd.ExecuteScalar());
-            }
-        }
-
-        static int SearchColumnRegex(SqlConnection conn, string tableName, string columnName, string regexPattern)
-        {
-            // For regex, we need to pull data and filter in .NET since SQL Server doesn't have built-in regex
-            string sql = $"SELECT [{columnName}] FROM [{tableName}] WHERE [{columnName}] IS NOT NULL";
-            int matchCount = 0;
-
-            try
-            {
-                var regex = new Regex(regexPattern, RegexOptions.IgnoreCase);
-
-                using (var cmd = new SqlCommand(sql, conn))
-                {
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            var value = reader[0];
-                            if (value != null && value != DBNull.Value)
-                            {
-                                string stringValue = value.ToString() ?? "";
-                                if (regex.IsMatch(stringValue))
-                                {
-                                    matchCount++;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteError($"Error in regex search: {ex.Message}");
-            }
-
-            return matchCount;
-        }
-
-        static List<string> GetSampleData(SqlConnection conn, string tableName, string columnName, string searchValue, int maxSamples)
-        {
-            var samples = new List<string>();
-
-            string sql = $"SELECT TOP ({maxSamples}) [{columnName}] FROM [{tableName}] WHERE [{columnName}] LIKE @SearchValue ORDER BY [{columnName}]";
-
-            using (var cmd = new SqlCommand(sql, conn))
-            {
-                cmd.Parameters.AddWithValue("@SearchValue", searchValue);
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var value = reader[0];
-                        string displayValue = (value == null || value == DBNull.Value) ? "<NULL>" : (value.ToString() ?? "<NULL>");
-
-                        // Truncate long values for display
-                        int maxLength = int.Parse(ConfigurationManager.AppSettings["MaxDisplayLength"] ?? "50");
-                        if (displayValue.Length > maxLength)
-                        {
-                            displayValue = displayValue.Substring(0, maxLength - 3) + "...";
-                        }
-                        samples.Add(displayValue);
-                    }
-                }
-            }
-
-            return samples;
-        }
-
-        static List<string> GetSampleDataRegex(SqlConnection conn, string tableName, string columnName, string regexPattern, int maxSamples)
-        {
-            var samples = new List<string>();
-
-            try
-            {
-                var regex = new Regex(regexPattern, RegexOptions.IgnoreCase);
-                string sql = $"SELECT [{columnName}] FROM [{tableName}] WHERE [{columnName}] IS NOT NULL ORDER BY [{columnName}]";
-
-                using (var cmd = new SqlCommand(sql, conn))
-                {
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read() && samples.Count < maxSamples)
-                        {
-                            var value = reader[0];
-                            if (value != null && value != DBNull.Value)
-                            {
-                                string stringValue = value.ToString() ?? "";
-                                if (regex.IsMatch(stringValue))
-                                {
-                                    // Truncate long values for display
-                                    int maxLength = int.Parse(ConfigurationManager.AppSettings["MaxDisplayLength"] ?? "50");
-                                    if (stringValue.Length > maxLength)
-                                    {
-                                        stringValue = stringValue.Substring(0, maxLength - 3) + "...";
-                                    }
-                                    samples.Add(stringValue);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteError($"Error getting regex sample data: {ex.Message}");
-            }
-
-            return samples;
-        }
     }
-
-    public class MatchingRecord
-{
-    public string ColumnName { get; set; } = string.Empty;
-    public string MatchingValue { get; set; } = string.Empty;
-    public Dictionary<string, string> PrimaryKeyValues { get; set; } = new Dictionary<string, string>();
-}
-
-public class TableViewInfo
-{
-    public string Name { get; set; } = string.Empty;
-    public string Type { get; set; } = string.Empty; // T = Table, V = View
-    public long RowCount { get; set; }
-}
-
-public class ColumnInfo
-{
-    public string Name { get; set; } = string.Empty;
-    public string DataType { get; set; } = string.Empty;
-    public int MaxLength { get; set; }
-    public bool IsNullable { get; set; }
-}
 }
