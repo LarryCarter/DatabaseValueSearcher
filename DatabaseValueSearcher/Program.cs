@@ -13,16 +13,21 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.IO.Compression;
+using System.Text;
 
 namespace DatabaseValueSearcher
 {
-
     partial class Program
     {
         private static Dictionary<string, string> environments = new Dictionary<string, string>();
         private static CacheManager cacheManager = new CacheManager();
         private static PerformanceManager performanceManager = new PerformanceManager();
         private static SearchSession? currentSession;
+
+        // New caches for database and table lists
+        private static Dictionary<string, List<string>> databaseListCache = new Dictionary<string, List<string>>();
+        private static Dictionary<string, List<TableViewInfo>> tableListCache = new Dictionary<string, List<TableViewInfo>>();
+        private static Dictionary<string, DateTime> cacheTimestamps = new Dictionary<string, DateTime>();
 
         static async Task Main(string[] args)
         {
@@ -57,8 +62,6 @@ namespace DatabaseValueSearcher
                 Environment.Exit(1);
             }
         }
-
-        
 
         static void LoadEnvironments()
         {
@@ -105,7 +108,7 @@ namespace DatabaseValueSearcher
             DisplayMessages.WriteInfo("DATABASE VALUE SEARCHER - INTERACTIVE MODE");
             DisplayMessages.WriteInfo("============================================");
             Console.WriteLine();
-            DisplayMessages.WriteHighlight("Navigation: Type 'back' to go back, 'quit' to exit, 'cache' for cache options");
+            DisplayMessages.WriteHighlight("Navigation: Type 'back' to go back, 'quit' to exit, 'cache' for cache options, 'export' to export cache data");
             ShowCacheStatus();
             Console.WriteLine();
 
@@ -114,33 +117,8 @@ namespace DatabaseValueSearcher
                 // Check if we have an active session
                 if (currentSession != null)
                 {
-                    DisplayMessages.WriteInfo($"Active Session: {currentSession.Environment} > {currentSession.Database} > {currentSession.TableName}");
-                    DisplayMessages.WriteHighlight("Options: 'search' for new search, 'refresh' to reload data, 'clear' to start over");
-                    Console.WriteLine();
-
-                    Console.Write("Choose action [search/refresh/clear/cache/quit]: ");
-                    string action = Console.ReadLine()?.Trim() ?? "";
-
-                    switch (action.ToLower())
-                    {
-                        case "search":
-                            await PerformCachedSearch();
-                            continue;
-                        case "refresh":
-                            await RefreshCurrentTable();
-                            continue;
-                        case "clear":
-                            currentSession = null;
-                            break;
-                        case "cache":
-                            await HandleCacheCommands();
-                            continue;
-                        case "quit":
-                            return;
-                        default:
-                            DisplayMessages.WriteError("Invalid option. Please try again.");
-                            continue;
-                    }
+                    await HandleActiveSession();
+                    continue;
                 }
 
                 // New session flow
@@ -249,17 +227,117 @@ namespace DatabaseValueSearcher
             await SearchCachedTable(currentSession, searchValue, useRegex);
         }
 
+        static async Task HandleActiveSession()
+        {
+            if (currentSession == null) return;
+
+            DisplayMessages.WriteInfo($"Active Session: {currentSession.Environment} > {currentSession.Database} > {currentSession.TableName}");
+            DisplayMessages.WriteHighlight("Options:");
+            Console.WriteLine("  'search' - New search on current table");
+            Console.WriteLine("  'refresh' - Reload current table data");
+            Console.WriteLine("  'table' - Select different table (same database)");
+            Console.WriteLine("  'database' - Select different database");
+            Console.WriteLine("  'clear' - Start completely over");
+            Console.WriteLine("  'export' - Export current table cache to SQL");
+            Console.WriteLine("  'cache' - Cache management");
+            Console.WriteLine("  'quit' - Exit application");
+            Console.WriteLine();
+
+            Console.Write("Choose action: ");
+            string action = Console.ReadLine()?.Trim() ?? "";
+
+            switch (action.ToLower())
+            {
+                case "search":
+                    await PerformCachedSearch();
+                    break;
+                case "refresh":
+                    await RefreshCurrentTable();
+                    break;
+                case "table":
+                    await SelectNewTable();
+                    break;
+                case "database":
+                    await SelectNewDatabase();
+                    break;
+                case "clear":
+                    currentSession = null;
+                    break;
+                case "export":
+                    await ExportTableCacheToSQL();
+                    break;
+                case "cache":
+                    await HandleCacheCommands();
+                    break;
+                case "quit":
+                    Environment.Exit(0);
+                    break;
+                default:
+                    DisplayMessages.WriteError("Invalid option. Please try again.");
+                    break;
+            }
+        }
+
+        static async Task SelectNewTable()
+        {
+            if (currentSession == null) return;
+
+            string tableOrView = await SelectTableOrView(currentSession.Environment, currentSession.Database);
+            if (tableOrView == "quit")
+            {
+                Environment.Exit(0);
+            }
+            else if (tableOrView != "back" && tableOrView != "cache")
+            {
+                // Update session with new table
+                currentSession.TableName = tableOrView;
+                currentSession.CachedData = null; // Clear old cache data
+                currentSession.CreatedAt = DateTime.Now;
+                currentSession.LastSearchedPage = 0;
+
+                await InitializeTableCache(currentSession);
+                await PerformCachedSearch();
+            }
+        }
+
+        static async Task SelectNewDatabase()
+        {
+            if (currentSession == null) return;
+
+            string database = await SelectDatabase(currentSession.Environment);
+            if (database == "quit")
+            {
+                Environment.Exit(0);
+            }
+            else if (database != "back" && database != "cache")
+            {
+                // Update session with new database
+                currentSession.Database = database;
+                currentSession.TableName = "";
+                currentSession.CachedData = null;
+                currentSession.CreatedAt = DateTime.Now;
+                currentSession.LastSearchedPage = 0;
+
+                // Now select table
+                await SelectNewTable();
+            }
+        }
+
         static async Task HandleCacheCommands()
         {
             Console.WriteLine();
             DisplayMessages.WriteInfo("Cache Management Options:");
             Console.WriteLine("  1. Show cache status");
-            Console.WriteLine("  2. Clear all cache");
-            Console.WriteLine("  3. Clear current table cache");
-            Console.WriteLine("  4. Cache statistics");
+            Console.WriteLine("  2. Show all cached tables");
+            Console.WriteLine("  3. Validate cache integrity");
+            Console.WriteLine("  4. Clear all cache");
+            Console.WriteLine("  5. Clear current table cache");
+            Console.WriteLine("  6. Clear specific table cache");
+            Console.WriteLine("  7. Export cached table to SQL");
+            Console.WriteLine("  8. Cache statistics");
             Console.WriteLine();
 
-            Console.Write("Select option (1-4) [back]: ");
+            Console.Write("Select option (1-8) [back]: ");
             string input = Console.ReadLine()?.Trim() ?? "";
 
             switch (input)
@@ -268,23 +346,25 @@ namespace DatabaseValueSearcher
                     ShowCacheStatus();
                     break;
                 case "2":
-                    cacheManager.ClearCache();
-                    DisplayMessages.WriteSuccess("All cache cleared.");
+                    ShowAllCachedTables();
                     break;
                 case "3":
-                    if (currentSession != null)
-                    {
-                        var cacheKey = cacheManager.GetCacheKey(currentSession.Environment, currentSession.Database, currentSession.TableName);
-                        cacheManager.ClearCache(cacheKey);
-                        DisplayMessages.WriteSuccess($"Cache cleared for {currentSession.TableName}.");
-                    }
-                    else
-                    {
-                        DisplayMessages.WriteWarning("No active session to clear cache for.");
-                    }
+                    await ValidateCacheIntegrity();
                     break;
                 case "4":
-                    ShowCacheStatistics();
+                    await ClearAllCache();
+                    break;
+                case "5":
+                    ClearCurrentTableCache();
+                    break;
+                case "6":
+                    await ClearSpecificTableCache();
+                    break;
+                case "7":
+                    await ExportCachedTableMenu();
+                    break;
+                case "8":
+                    ShowDetailedCacheStatistics();
                     break;
                 case "back":
                 case "":
@@ -309,7 +389,342 @@ namespace DatabaseValueSearcher
             DisplayMessages.WriteInfo($"Cache Status: Enabled | Size: {cacheSize / 1024 / 1024:F1} MB");
         }
 
-        static void ShowCacheStatistics()
+        static void ShowAllCachedTables()
+        {
+            var cachedTables = cacheManager.GetAllCachedTables();
+
+            if (!cachedTables.Any())
+            {
+                DisplayMessages.WriteWarning("No cached tables found.");
+                return;
+            }
+
+            Console.WriteLine();
+            DisplayMessages.WriteInfo("ALL CACHED TABLES:");
+            DisplayMessages.WriteInfo("================================================================");
+
+            var totalSize = cachedTables.Sum(t => t.TotalCacheSize);
+            Console.WriteLine($"Total cached tables: {cachedTables.Count}");
+            Console.WriteLine($"Total cache size: {(totalSize / 1024 / 1024):F1} MB");
+            Console.WriteLine();
+
+            var grouped = cachedTables.GroupBy(t => $"{t.Environment}.{t.Database}");
+
+            foreach (var group in grouped)
+            {
+                DisplayMessages.WriteColoredInline($"{group.Key}:", ConsoleColor.Cyan);
+                Console.WriteLine();
+
+                foreach (var table in group)
+                {
+                    string status = "";
+                    if (table.CachedAt != DateTime.MinValue)
+                    {
+                        var age = DateTime.Now - table.CachedAt;
+                        if (age.TotalHours < 1)
+                            status = $"({age.TotalMinutes:F0}m old)";
+                        else if (age.TotalDays < 1)
+                            status = $"({age.TotalHours:F0}h old)";
+                        else
+                            status = $"({age.TotalDays:F0}d old)";
+                    }
+
+                    var completeness = table.IsComplete ? "Complete" : "Partial";
+
+                    Console.Write("  ");
+                    DisplayMessages.WriteColoredInline($"[{table.TableName}]", ConsoleColor.Green);
+                    Console.WriteLine($" {table.TotalRows:N0} rows, {table.CachedPages} pages, {table.SizeDisplay} {status} - {completeness}");
+                }
+                Console.WriteLine();
+            }
+        }
+
+        static async Task ValidateCacheIntegrity()
+        {
+            Console.WriteLine();
+
+            if (currentSession != null)
+            {
+                Console.Write("Validate current table cache? [Y/n]: ");
+                string response = Console.ReadLine()?.Trim() ?? "";
+
+                if (string.IsNullOrEmpty(response) || response.Equals("y", StringComparison.OrdinalIgnoreCase))
+                {
+                    var cacheKey = cacheManager.GetCacheKey(currentSession.Environment, currentSession.Database, currentSession.TableName);
+                    await ValidateSpecificCache(cacheKey, $"{currentSession.Environment}.{currentSession.Database}.{currentSession.TableName}");
+                    return;
+                }
+            }
+
+            // Show all cached tables for validation
+            var cachedTables = cacheManager.GetAllCachedTables();
+
+            if (!cachedTables.Any())
+            {
+                DisplayMessages.WriteWarning("No cached tables found to validate.");
+                return;
+            }
+
+            Console.WriteLine("Select table to validate:");
+            for (int i = 0; i < cachedTables.Count; i++)
+            {
+                var table = cachedTables[i];
+                Console.WriteLine($"  {i + 1}. {table.Environment}.{table.Database}.{table.TableName}");
+            }
+
+            Console.Write($"Select table (1-{cachedTables.Count}) [back]: ");
+            string input = Console.ReadLine()?.Trim() ?? "";
+
+            if (input.Equals("back", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(input))
+                return;
+
+            if (int.TryParse(input, out int selection) && selection >= 1 && selection <= cachedTables.Count)
+            {
+                var selectedTable = cachedTables[selection - 1];
+                await ValidateSpecificCache(selectedTable.CacheKey, $"{selectedTable.Environment}.{selectedTable.Database}.{selectedTable.TableName}");
+            }
+            else
+            {
+                DisplayMessages.WriteError("Invalid selection.");
+            }
+        }
+
+        static async Task ValidateSpecificCache(string cacheKey, string displayName)
+        {
+            DisplayMessages.WriteInfo($"Validating cache for {displayName}...");
+
+            var result = cacheManager.ValidateCache(cacheKey);
+
+            Console.WriteLine();
+            DisplayMessages.WriteInfo("CACHE VALIDATION RESULTS:");
+            DisplayMessages.WriteInfo("----------------------------------------");
+            Console.WriteLine($"Table: {displayName}");
+            Console.WriteLine($"Cache Key: {cacheKey}");
+
+            if (result.IsValid)
+            {
+                DisplayMessages.WriteColoredInline("Status: ", ConsoleColor.White);
+                DisplayMessages.WriteColoredInline("VALID", ConsoleColor.Green);
+                Console.WriteLine();
+            }
+            else
+            {
+                DisplayMessages.WriteColoredInline("Status: ", ConsoleColor.White);
+                DisplayMessages.WriteColoredInline("INVALID", ConsoleColor.Red);
+                Console.WriteLine();
+            }
+
+            if (result.ExpectedPages > 0)
+            {
+                Console.WriteLine($"Expected Pages: {result.ExpectedPages}");
+                Console.WriteLine($"Actual Pages: {result.ActualPages}");
+
+                if (result.ActualPages == result.ExpectedPages)
+                {
+                    DisplayMessages.WriteColoredInline("Page Coverage: ", ConsoleColor.White);
+                    DisplayMessages.WriteColoredInline("100%", ConsoleColor.Green);
+                    Console.WriteLine();
+                }
+                else
+                {
+                    var coverage = result.ExpectedPages > 0 ? (double)result.ActualPages / result.ExpectedPages * 100 : 0;
+                    DisplayMessages.WriteColoredInline("Page Coverage: ", ConsoleColor.White);
+                    DisplayMessages.WriteColoredInline($"{coverage:F1}%", coverage > 90 ? ConsoleColor.Yellow : ConsoleColor.Red);
+                    Console.WriteLine();
+                }
+            }
+
+            Console.WriteLine();
+            DisplayMessages.WriteInfo("Issues Found:");
+            foreach (var issue in result.Issues)
+            {
+                if (issue.Contains("passed"))
+                {
+                    DisplayMessages.WriteColoredInline("  ✓ ", ConsoleColor.Green);
+                    Console.WriteLine(issue);
+                }
+                else
+                {
+                    DisplayMessages.WriteColoredInline("  ✗ ", ConsoleColor.Red);
+                    Console.WriteLine(issue);
+                }
+            }
+        }
+
+        static async Task ClearAllCache()
+        {
+            Console.WriteLine();
+            DisplayMessages.WriteWarning("This will clear ALL cached data for ALL tables.");
+            Console.Write("Are you sure? [y/N]: ");
+            string response = Console.ReadLine()?.Trim() ?? "";
+
+            if (response.Equals("y", StringComparison.OrdinalIgnoreCase))
+            {
+                cacheManager.ClearCache();
+
+                // Also clear our in-memory caches
+                databaseListCache.Clear();
+                tableListCache.Clear();
+                cacheTimestamps.Clear();
+
+                DisplayMessages.WriteSuccess("All cache cleared successfully.");
+
+                // Clear current session cache reference
+                if (currentSession != null)
+                {
+                    currentSession.CachedData = null;
+                }
+            }
+            else
+            {
+                DisplayMessages.WriteInfo("Cache clear cancelled.");
+            }
+        }
+
+        static void ClearCurrentTableCache()
+        {
+            if (currentSession != null)
+            {
+                var cacheKey = cacheManager.GetCacheKey(currentSession.Environment, currentSession.Database, currentSession.TableName);
+                cacheManager.ClearCache(cacheKey);
+                currentSession.CachedData = null;
+                DisplayMessages.WriteSuccess($"Cache cleared for {currentSession.TableName}.");
+            }
+            else
+            {
+                DisplayMessages.WriteWarning("No active session to clear cache for.");
+            }
+        }
+
+        static async Task ClearSpecificTableCache()
+        {
+            var cachedTables = cacheManager.GetAllCachedTables();
+
+            if (!cachedTables.Any())
+            {
+                DisplayMessages.WriteWarning("No cached tables found.");
+                return;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("Select table cache to clear:");
+            for (int i = 0; i < cachedTables.Count; i++)
+            {
+                var table = cachedTables[i];
+                Console.WriteLine($"  {i + 1}. {table.Environment}.{table.Database}.{table.TableName} ({table.SizeDisplay})");
+            }
+
+            Console.Write($"Select table (1-{cachedTables.Count}) [back]: ");
+            string input = Console.ReadLine()?.Trim() ?? "";
+
+            if (input.Equals("back", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(input))
+                return;
+
+            if (int.TryParse(input, out int selection) && selection >= 1 && selection <= cachedTables.Count)
+            {
+                var selectedTable = cachedTables[selection - 1];
+
+                Console.WriteLine();
+                DisplayMessages.WriteWarning($"This will clear cache for {selectedTable.Environment}.{selectedTable.Database}.{selectedTable.TableName}");
+                Console.Write("Are you sure? [y/N]: ");
+                string response = Console.ReadLine()?.Trim() ?? "";
+
+                if (response.Equals("y", StringComparison.OrdinalIgnoreCase))
+                {
+                    cacheManager.ClearCache(selectedTable.CacheKey);
+                    DisplayMessages.WriteSuccess($"Cache cleared for {selectedTable.TableName}.");
+
+                    // Clear current session if it matches
+                    if (currentSession != null &&
+                        currentSession.Environment == selectedTable.Environment &&
+                        currentSession.Database == selectedTable.Database &&
+                        currentSession.TableName == selectedTable.TableName)
+                    {
+                        currentSession.CachedData = null;
+                    }
+                }
+                else
+                {
+                    DisplayMessages.WriteInfo("Cache clear cancelled.");
+                }
+            }
+            else
+            {
+                DisplayMessages.WriteError("Invalid selection.");
+            }
+        }
+
+        static async Task ExportCachedTableMenu()
+        {
+            Console.WriteLine();
+
+            if (currentSession?.CachedData != null)
+            {
+                Console.Write("Export current table cache? [Y/n]: ");
+                string response = Console.ReadLine()?.Trim() ?? "";
+
+                if (string.IsNullOrEmpty(response) || response.Equals("y", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ExportTableCacheToSQL();
+                    return;
+                }
+            }
+
+            // Show all cached tables for export
+            var cachedTables = cacheManager.GetAllCachedTables();
+
+            if (!cachedTables.Any())
+            {
+                DisplayMessages.WriteWarning("No cached tables found to export.");
+                return;
+            }
+
+            Console.WriteLine("Select table to export:");
+            for (int i = 0; i < cachedTables.Count; i++)
+            {
+                var table = cachedTables[i];
+                var completeness = table.IsComplete ? "Complete" : "Partial";
+                Console.WriteLine($"  {i + 1}. {table.Environment}.{table.Database}.{table.TableName} ({table.TotalRows:N0} rows, {completeness})");
+            }
+
+            Console.Write($"Select table (1-{cachedTables.Count}) [back]: ");
+            string input = Console.ReadLine()?.Trim() ?? "";
+
+            if (input.Equals("back", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(input))
+                return;
+
+            if (int.TryParse(input, out int selection) && selection >= 1 && selection <= cachedTables.Count)
+            {
+                var selectedTable = cachedTables[selection - 1];
+
+                // Create temporary session for export
+                var tempSession = new SearchSession
+                {
+                    Environment = selectedTable.Environment,
+                    Database = selectedTable.Database,
+                    TableName = selectedTable.TableName,
+                    CachedData = cacheManager.LoadMetadata(selectedTable.CacheKey)
+                };
+
+                var originalSession = currentSession;
+                currentSession = tempSession;
+
+                try
+                {
+                    await ExportTableCacheToSQL();
+                }
+                finally
+                {
+                    currentSession = originalSession;
+                }
+            }
+            else
+            {
+                DisplayMessages.WriteError("Invalid selection.");
+            }
+        }
+
+        static void ShowDetailedCacheStatistics()
         {
             var cacheDirectory = ConfigurationManager.AppSettings["CacheDirectory"] ?? "./Cache";
             if (!Directory.Exists(cacheDirectory))
@@ -322,14 +737,53 @@ namespace DatabaseValueSearcher
             var totalSize = files.Sum(f => new FileInfo(f).Length);
             var metadataFiles = files.Count(f => f.Contains("_metadata.json"));
             var pageFiles = files.Count(f => f.Contains("_page_"));
+            var compressedFiles = files.Count(f => f.EndsWith(".gz"));
+
+            var cachedTables = cacheManager.GetAllCachedTables();
+            var completelyCache = cachedTables.Count(t => t.IsComplete);
+            var totalRows = cachedTables.Sum(t => t.TotalRows);
 
             Console.WriteLine();
-            DisplayMessages.WriteInfo("CACHE STATISTICS:");
-            Console.WriteLine($"  Total Files: {files.Length}");
-            Console.WriteLine($"  Metadata Files: {metadataFiles}");
-            Console.WriteLine($"  Data Page Files: {pageFiles}");
-            Console.WriteLine($"  Total Size: {totalSize / 1024 / 1024:F2} MB");
-            Console.WriteLine($"  Cache Directory: {cacheDirectory}");
+            DisplayMessages.WriteInfo("DETAILED CACHE STATISTICS:");
+            DisplayMessages.WriteInfo("================================================================");
+            Console.WriteLine($"Cache Directory: {cacheDirectory}");
+            Console.WriteLine($"Total Files: {files.Length:N0}");
+            Console.WriteLine($"  - Metadata Files: {metadataFiles:N0}");
+            Console.WriteLine($"  - Data Page Files: {pageFiles:N0}");
+            Console.WriteLine($"  - Compressed Files: {compressedFiles:N0}");
+            Console.WriteLine($"Total Size: {totalSize / 1024 / 1024:F2} MB");
+            Console.WriteLine();
+            Console.WriteLine($"Cached Tables: {cachedTables.Count:N0}");
+            Console.WriteLine($"  - Completely Cached: {completelyCache:N0}");
+            Console.WriteLine($"  - Partially Cached: {cachedTables.Count - completelyCache:N0}");
+            Console.WriteLine($"Total Cached Rows: {totalRows:N0}");
+
+            if (cachedTables.Any())
+            {
+                var oldestCache = cachedTables.Where(t => t.CachedAt != DateTime.MinValue).OrderBy(t => t.CachedAt).FirstOrDefault();
+                var newestCache = cachedTables.Where(t => t.CachedAt != DateTime.MinValue).OrderByDescending(t => t.CachedAt).FirstOrDefault();
+
+                if (oldestCache != null)
+                {
+                    Console.WriteLine($"Oldest Cache: {oldestCache.TableName} ({oldestCache.CachedAt:yyyy-MM-dd HH:mm})");
+                }
+                if (newestCache != null)
+                {
+                    Console.WriteLine($"Newest Cache: {newestCache.TableName} ({newestCache.CachedAt:yyyy-MM-dd HH:mm})");
+                }
+            }
+
+            Console.WriteLine();
+
+            // Show cache efficiency
+            if (pageFiles > 0)
+            {
+                var avgPageSize = totalSize / pageFiles;
+                Console.WriteLine($"Average Page Size: {avgPageSize / 1024:F1} KB");
+
+                var compressionRatio = compressedFiles > 0 ? (double)compressedFiles / pageFiles * 100 : 0;
+                Console.WriteLine($"Compression Ratio: {compressionRatio:F1}%");
+            }
         }
 
         static async Task InitializeTableCache(SearchSession session)
@@ -602,17 +1056,84 @@ namespace DatabaseValueSearcher
 
         static bool IsLikeMatch(string text, string pattern)
         {
+            // Handle simple cases first for better performance
+            if (string.IsNullOrEmpty(pattern))
+                return string.IsNullOrEmpty(text);
+
+            if (pattern == "%")
+                return true; // % matches everything
+
             // Convert SQL LIKE pattern to regex
-            var regexPattern = "^" + Regex.Escape(pattern)
-                .Replace("\\%", ".*")
-                .Replace("\\_", ".") + "$";
+            // First escape all regex special characters except % and _
+            var escaped = "";
+            foreach (char c in pattern)
+            {
+                switch (c)
+                {
+                    case '%':
+                        escaped += ".*";
+                        break;
+                    case '_':
+                        escaped += ".";
+                        break;
+                    case '\\':
+                        escaped += "\\\\";
+                        break;
+                    case '^':
+                        escaped += "\\^";
+                        break;
+                    case '$':
+                        escaped += "\\$";
+                        break;
+                    case '.':
+                        escaped += "\\.";
+                        break;
+                    case '|':
+                        escaped += "\\|";
+                        break;
+                    case '?':
+                        escaped += "\\?";
+                        break;
+                    case '*':
+                        escaped += "\\*";
+                        break;
+                    case '+':
+                        escaped += "\\+";
+                        break;
+                    case '(':
+                        escaped += "\\(";
+                        break;
+                    case ')':
+                        escaped += "\\)";
+                        break;
+                    case '[':
+                        escaped += "\\[";
+                        break;
+                    case ']':
+                        escaped += "\\]";
+                        break;
+                    case '{':
+                        escaped += "\\{";
+                        break;
+                    case '}':
+                        escaped += "\\}";
+                        break;
+                    default:
+                        escaped += c;
+                        break;
+                }
+            }
+
+            // Add anchors to ensure full string match
+            var regexPattern = "^" + escaped + "$";
 
             try
             {
                 return Regex.IsMatch(text, regexPattern, RegexOptions.IgnoreCase);
             }
-            catch
+            catch (Exception)
             {
+                // If regex fails for any reason, fall back to simple string comparison
                 return false;
             }
         }
@@ -868,8 +1389,29 @@ namespace DatabaseValueSearcher
         {
             try
             {
-                string baseConnectionString = GetBaseConnectionString(environment);
-                var databases = await GetDatabaseListAsync(baseConnectionString);
+                // Check if we have cached database list and if it's still valid
+                string cacheKey = $"databases_{environment}";
+                bool useCache = databaseListCache.ContainsKey(cacheKey) &&
+                               cacheTimestamps.ContainsKey(cacheKey) &&
+                               (DateTime.Now - cacheTimestamps[cacheKey]).TotalHours < 24;
+
+                List<string> databases;
+
+                if (useCache)
+                {
+                    databases = databaseListCache[cacheKey];
+                    DisplayMessages.WriteInfo($"Using cached database list (cached {cacheTimestamps[cacheKey]:yyyy-MM-dd HH:mm})");
+                }
+                else
+                {
+                    DisplayMessages.WriteInfo("Loading database list...");
+                    string baseConnectionString = GetBaseConnectionString(environment);
+                    databases = await GetDatabaseListAsync(baseConnectionString);
+
+                    // Cache the results
+                    databaseListCache[cacheKey] = databases;
+                    cacheTimestamps[cacheKey] = DateTime.Now;
+                }
 
                 if (databases.Count == 0)
                 {
@@ -885,14 +1427,29 @@ namespace DatabaseValueSearcher
                     Console.WriteLine($"  {i + 1}. {databases[i]}");
                 }
 
+                if (databaseListCache.ContainsKey(cacheKey))
+                {
+                    Console.WriteLine();
+                    DisplayMessages.WriteHighlight("Options: [r=refresh list, back/cache/quit]");
+                }
+
                 while (true)
                 {
-                    Console.Write($"Select database (1-{databases.Count}) [back/cache/quit]: ");
+                    Console.Write($"Select database (1-{databases.Count}): ");
                     string input = Console.ReadLine()?.Trim() ?? "";
 
                     if (input.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
                     if (input.Equals("back", StringComparison.OrdinalIgnoreCase)) return "back";
                     if (input.Equals("cache", StringComparison.OrdinalIgnoreCase)) return "cache";
+
+                    if (input.Equals("r", StringComparison.OrdinalIgnoreCase) ||
+                        input.Equals("refresh", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Clear cache and reload
+                        if (databaseListCache.ContainsKey(cacheKey)) databaseListCache.Remove(cacheKey);
+                        if (cacheTimestamps.ContainsKey(cacheKey)) cacheTimestamps.Remove(cacheKey);
+                        return await SelectDatabase(environment); // Recursive call to reload
+                    }
 
                     if (int.TryParse(input, out int selection) && selection >= 1 && selection <= databases.Count)
                     {
@@ -953,8 +1510,29 @@ namespace DatabaseValueSearcher
         {
             try
             {
-                string connectionString = GetFullConnectionString(environment, database);
-                var tablesAndViews = await GetTablesAndViewsAsync(connectionString);
+                // Check if we have cached table list
+                string cacheKey = $"tables_{environment}_{database}";
+                bool useCache = tableListCache.ContainsKey(cacheKey) &&
+                               cacheTimestamps.ContainsKey(cacheKey) &&
+                               (DateTime.Now - cacheTimestamps[cacheKey]).TotalHours < 24;
+
+                List<TableViewInfo> tablesAndViews;
+
+                if (useCache)
+                {
+                    tablesAndViews = tableListCache[cacheKey];
+                    DisplayMessages.WriteInfo($"Using cached table list (cached {cacheTimestamps[cacheKey]:yyyy-MM-dd HH:mm})");
+                }
+                else
+                {
+                    DisplayMessages.WriteInfo("Loading table and view list...");
+                    string connectionString = GetFullConnectionString(environment, database);
+                    tablesAndViews = await GetTablesAndViewsAsync(connectionString);
+
+                    // Cache the results
+                    tableListCache[cacheKey] = tablesAndViews;
+                    cacheTimestamps[cacheKey] = DateTime.Now;
+                }
 
                 if (tablesAndViews.Count == 0)
                 {
@@ -966,14 +1544,29 @@ namespace DatabaseValueSearcher
 
                 DisplayTablesAndViews(tablesAndViews);
 
+                if (tableListCache.ContainsKey(cacheKey))
+                {
+                    Console.WriteLine();
+                    DisplayMessages.WriteHighlight("Options: [f=filter, r=refresh list, back/cache/quit]");
+                }
+
                 while (true)
                 {
-                    Console.Write($"Select table/view (1-{tablesAndViews.Count}) [f=filter, back/cache/quit]: ");
+                    Console.Write($"Select table/view (1-{tablesAndViews.Count}): ");
                     string input = Console.ReadLine()?.Trim() ?? "";
 
                     if (input.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
                     if (input.Equals("back", StringComparison.OrdinalIgnoreCase)) return "back";
                     if (input.Equals("cache", StringComparison.OrdinalIgnoreCase)) return "cache";
+
+                    if (input.Equals("r", StringComparison.OrdinalIgnoreCase) ||
+                        input.Equals("refresh", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Clear cache and reload
+                        if (tableListCache.ContainsKey(cacheKey)) tableListCache.Remove(cacheKey);
+                        if (cacheTimestamps.ContainsKey(cacheKey)) cacheTimestamps.Remove(cacheKey);
+                        return await SelectTableOrView(environment, database); // Recursive call to reload
+                    }
 
                     // Handle filter option
                     if (input.Equals("f", StringComparison.OrdinalIgnoreCase))
@@ -1237,7 +1830,176 @@ namespace DatabaseValueSearcher
             }
         }
 
-        
+        static async Task ExportTableCacheToSQL()
+        {
+            if (currentSession?.CachedData == null)
+            {
+                DisplayMessages.WriteError("No cached table data available to export.");
+                return;
+            }
+
+            DisplayMessages.WriteInfo("Exporting cached table data to SQL file...");
+
+            try
+            {
+                var cacheKey = cacheManager.GetCacheKey(currentSession.Environment, currentSession.Database, currentSession.TableName);
+                var metadata = currentSession.CachedData;
+
+                // Calculate total pages
+                var totalPages = (int)Math.Ceiling((double)metadata.TotalRows / metadata.PageSize);
+
+                // Create export filename
+                var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                var filename = $"{currentSession.TableName}_Export_{timestamp}.sql";
+                var exportPath = Path.Combine(Environment.CurrentDirectory, "Exports");
+
+                if (!Directory.Exists(exportPath))
+                {
+                    Directory.CreateDirectory(exportPath);
+                }
+
+                var fullPath = Path.Combine(exportPath, filename);
+
+                using var writer = new StreamWriter(fullPath, false, Encoding.UTF8);
+
+                // Write header
+                await writer.WriteLineAsync("-- SQL Export Generated by Database Value Searcher");
+                await writer.WriteLineAsync($"-- Source: {currentSession.Environment}.{currentSession.Database}.{currentSession.TableName}");
+                await writer.WriteLineAsync($"-- Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                await writer.WriteLineAsync($"-- Total Rows: {metadata.TotalRows:N0}");
+                await writer.WriteLineAsync();
+
+                // Write table creation script
+                await WriteTableCreateScript(writer, metadata);
+                await writer.WriteLineAsync();
+
+                var insertedRows = 0;
+                var batchSize = 1000; // Insert in batches
+                var currentBatch = new List<Dictionary<string, object?>>();
+
+                DisplayMessages.WriteInfo($"Processing {totalPages} pages for export...");
+
+                // Process each page
+                for (int pageNum = 1; pageNum <= totalPages; pageNum++)
+                {
+                    var page = await LoadOrFetchPage(currentSession, pageNum);
+                    if (page?.Rows == null || !page.Rows.Any()) continue;
+
+                    foreach (var row in page.Rows)
+                    {
+                        currentBatch.Add(row);
+
+                        if (currentBatch.Count >= batchSize)
+                        {
+                            await WriteInsertBatch(writer, currentSession.TableName, metadata, currentBatch);
+                            insertedRows += currentBatch.Count;
+                            currentBatch.Clear();
+                        }
+                    }
+
+                    // Show progress
+                    if (totalPages > 10 && pageNum % Math.Max(1, totalPages / 10) == 0)
+                    {
+                        var progress = (double)pageNum / totalPages * 100;
+                        DisplayMessages.WriteInfo($"Export Progress: {progress:F1}% ({insertedRows:N0} rows exported)");
+                    }
+                }
+
+                // Write remaining batch
+                if (currentBatch.Any())
+                {
+                    await WriteInsertBatch(writer, currentSession.TableName, metadata, currentBatch);
+                    insertedRows += currentBatch.Count;
+                }
+
+                await writer.WriteLineAsync();
+                await writer.WriteLineAsync($"-- Export completed: {insertedRows:N0} rows exported");
+
+                DisplayMessages.WriteSuccess($"Export completed successfully!");
+                DisplayMessages.WriteInfo($"File: {fullPath}");
+                DisplayMessages.WriteInfo($"Rows exported: {insertedRows:N0}");
+            }
+            catch (Exception ex)
+            {
+                DisplayMessages.WriteError($"Export failed: {ex.Message}");
+            }
+        }
+
+        static async Task WriteTableCreateScript(StreamWriter writer, CachedTableData metadata)
+        {
+            await writer.WriteLineAsync($"-- Create table script for {metadata.TableName}");
+            await writer.WriteLineAsync($"IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[{metadata.TableName}]') AND type in (N'U'))");
+            await writer.WriteLineAsync("BEGIN");
+            await writer.WriteLineAsync($"    CREATE TABLE [{metadata.TableName}] (");
+
+            var columnDefinitions = new List<string>();
+
+            foreach (var column in metadata.Columns)
+            {
+                var lengthPart = column.MaxLength > 0 ? $"({column.MaxLength})" :
+                                column.MaxLength == -1 ? "(MAX)" : "";
+                var nullPart = column.IsNullable ? "NULL" : "NOT NULL";
+
+                columnDefinitions.Add($"        [{column.Name}] {column.DataType.ToUpper()}{lengthPart} {nullPart}");
+            }
+
+            await writer.WriteLineAsync(string.Join(",\n", columnDefinitions));
+
+            if (metadata.PrimaryKeys.Any())
+            {
+                await writer.WriteLineAsync(",");
+                var pkColumns = string.Join(", ", metadata.PrimaryKeys.Select(pk => $"[{pk}]"));
+                await writer.WriteLineAsync($"        CONSTRAINT [PK_{metadata.TableName}] PRIMARY KEY CLUSTERED ({pkColumns})");
+            }
+
+            await writer.WriteLineAsync("    );");
+            await writer.WriteLineAsync("END");
+        }
+
+        static async Task WriteInsertBatch(StreamWriter writer, string tableName, CachedTableData metadata, List<Dictionary<string, object?>> batch)
+        {
+            if (!batch.Any()) return;
+
+            var allColumns = new List<string>(metadata.Columns.Select(c => c.Name));
+            allColumns.AddRange(metadata.PrimaryKeys.Where(pk => !allColumns.Contains(pk)));
+
+            await writer.WriteLineAsync($"INSERT INTO [{tableName}] ([{string.Join("], [", allColumns)}])");
+            await writer.WriteLineAsync("VALUES");
+
+            var valueRows = new List<string>();
+
+            foreach (var row in batch)
+            {
+                var values = new List<string>();
+
+                foreach (var column in allColumns)
+                {
+                    var value = row.GetValueOrDefault(column);
+                    values.Add(FormatSQLValue(value));
+                }
+
+                valueRows.Add($"    ({string.Join(", ", values)})");
+            }
+
+            await writer.WriteLineAsync(string.Join(",\n", valueRows));
+            await writer.WriteLineAsync(";");
+            await writer.WriteLineAsync();
+        }
+
+        static string FormatSQLValue(object? value)
+        {
+            if (value == null || value == DBNull.Value)
+                return "NULL";
+
+            return value switch
+            {
+                string s => $"'{s.Replace("'", "''")}'",
+                DateTime dt => $"'{dt:yyyy-MM-dd HH:mm:ss.fff}'",
+                bool b => b ? "1" : "0",
+                byte[] bytes => $"0x{Convert.ToHexString(bytes)}",
+                _ => value.ToString() ?? "NULL"
+            };
+        }
 
         static string GetLengthDisplay(int maxLength)
         {
