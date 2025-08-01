@@ -8,36 +8,23 @@ using System.Linq;
 using Microsoft.Data.SqlClient;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.IO.Compression;
 
 namespace DatabaseValueSearcher
 {
-    public class MatchingRecord
-    {
-        public string ColumnName { get; set; } = string.Empty;
-        public string MatchingValue { get; set; } = string.Empty;
-        public Dictionary<string, string> PrimaryKeyValues { get; set; } = new Dictionary<string, string>();
-    }
 
-    public class TableViewInfo
-    {
-        public string Name { get; set; } = string.Empty;
-        public string Type { get; set; } = string.Empty; // T = Table, V = View
-        public long RowCount { get; set; }
-    }
-
-    public class ColumnInfo
-    {
-        public string Name { get; set; } = string.Empty;
-        public string DataType { get; set; } = string.Empty;
-        public int MaxLength { get; set; }
-        public bool IsNullable { get; set; }
-    }
-
-    class Program
+    partial class Program
     {
         private static Dictionary<string, string> environments = new Dictionary<string, string>();
+        private static CacheManager cacheManager = new CacheManager();
+        private static PerformanceManager performanceManager = new PerformanceManager();
+        private static SearchSession? currentSession;
 
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             try
             {
@@ -51,49 +38,27 @@ namespace DatabaseValueSearcher
 
                 if (args.Length == 0)
                 {
-                    RunInteractiveMode();
+                    await RunInteractiveMode();
                 }
                 else
                 {
-                    RunCommandLineMode(args);
+                    await RunCommandLineMode(args);
                 }
             }
             catch (Exception ex)
             {
-                WriteError($"FATAL ERROR: {ex.Message}");
+                DisplayMessages.WriteError($"FATAL ERROR: {ex.Message}");
                 if (ex.InnerException != null)
                 {
-                    WriteError($"Details: {ex.InnerException.Message}");
+                    DisplayMessages.WriteError($"Details: {ex.InnerException.Message}");
                 }
-                WriteWarning("Press any key to exit...");
+                DisplayMessages.WriteWarning("Press any key to exit...");
                 Console.ReadKey();
                 Environment.Exit(1);
             }
         }
 
-        #region Console Color Helpers
-        static void WriteSuccess(string message) => WriteColored(message, ConsoleColor.Green);
-        static void WriteInfo(string message) => WriteColored(message, ConsoleColor.Cyan);
-        static void WriteWarning(string message) => WriteColored(message, ConsoleColor.Yellow);
-        static void WriteError(string message) => WriteColored(message, ConsoleColor.Red);
-        static void WriteHighlight(string message) => WriteColored(message, ConsoleColor.Magenta);
-
-        static void WriteColored(string message, ConsoleColor color)
-        {
-            var originalColor = Console.ForegroundColor;
-            Console.ForegroundColor = color;
-            Console.WriteLine(message);
-            Console.ForegroundColor = originalColor;
-        }
-
-        static void WriteColoredInline(string message, ConsoleColor color)
-        {
-            var originalColor = Console.ForegroundColor;
-            Console.ForegroundColor = color;
-            Console.Write(message);
-            Console.ForegroundColor = originalColor;
-        }
-        #endregion
+        
 
         static void LoadEnvironments()
         {
@@ -125,110 +90,134 @@ namespace DatabaseValueSearcher
 
                 if (environments.Count == 0)
                 {
-                    WriteWarning("No environments configured. Please check your App.config file.");
+                    DisplayMessages.WriteWarning("No environments configured. Please check your App.config file.");
                 }
             }
             catch (Exception ex)
             {
-                WriteError($"Error loading environments: {ex.Message}");
+                DisplayMessages.WriteError($"Error loading environments: {ex.Message}");
             }
         }
 
-        static void RunInteractiveMode()
+        static async Task RunInteractiveMode()
         {
-            WriteInfo("============================================");
-            WriteInfo("DATABASE VALUE SEARCHER - INTERACTIVE MODE");
-            WriteInfo("============================================");
+            DisplayMessages.WriteInfo("============================================");
+            DisplayMessages.WriteInfo("DATABASE VALUE SEARCHER - INTERACTIVE MODE");
+            DisplayMessages.WriteInfo("============================================");
             Console.WriteLine();
-            WriteHighlight("Navigation: Type 'back' to go back, 'quit' to exit");
+            DisplayMessages.WriteHighlight("Navigation: Type 'back' to go back, 'quit' to exit, 'cache' for cache options");
+            ShowCacheStatus();
             Console.WriteLine();
 
             while (true) // Main loop to allow complete restart
             {
+                // Check if we have an active session
+                if (currentSession != null)
+                {
+                    DisplayMessages.WriteInfo($"Active Session: {currentSession.Environment} > {currentSession.Database} > {currentSession.TableName}");
+                    DisplayMessages.WriteHighlight("Options: 'search' for new search, 'refresh' to reload data, 'clear' to start over");
+                    Console.WriteLine();
+
+                    Console.Write("Choose action [search/refresh/clear/cache/quit]: ");
+                    string action = Console.ReadLine()?.Trim() ?? "";
+
+                    switch (action.ToLower())
+                    {
+                        case "search":
+                            await PerformCachedSearch();
+                            continue;
+                        case "refresh":
+                            await RefreshCurrentTable();
+                            continue;
+                        case "clear":
+                            currentSession = null;
+                            break;
+                        case "cache":
+                            await HandleCacheCommands();
+                            continue;
+                        case "quit":
+                            return;
+                        default:
+                            DisplayMessages.WriteError("Invalid option. Please try again.");
+                            continue;
+                    }
+                }
+
+                // New session flow
                 string environment = "";
                 string database = "";
                 string tableOrView = "";
-                string searchValue = "";
 
                 // Step 1: Select Environment
                 while (string.IsNullOrEmpty(environment))
                 {
                     environment = SelectEnvironment();
                     if (environment == "quit") return;
+                    if (environment == "cache")
+                    {
+                        await HandleCacheCommands();
+                        environment = "";
+                        continue;
+                    }
                 }
 
                 // Step 2: Select Database
                 while (string.IsNullOrEmpty(database))
                 {
-                    database = SelectDatabase(environment);
+                    database = await SelectDatabase(environment);
                     if (database == "quit") return;
                     if (database == "back")
                     {
                         environment = "";
                         break;
                     }
+                    if (database == "cache")
+                    {
+                        await HandleCacheCommands();
+                        continue;
+                    }
                 }
-                if (string.IsNullOrEmpty(environment)) continue; // Start over from environment
+                if (string.IsNullOrEmpty(environment)) continue;
 
                 // Step 3: Select Table or View
                 while (string.IsNullOrEmpty(tableOrView))
                 {
-                    tableOrView = SelectTableOrView(environment, database);
+                    tableOrView = await SelectTableOrView(environment, database);
                     if (tableOrView == "quit") return;
                     if (tableOrView == "back")
                     {
                         database = "";
                         break;
                     }
-                }
-                if (string.IsNullOrEmpty(database)) continue; // Go back to database selection
-
-                // Step 4: Get search parameters
-                while (string.IsNullOrEmpty(searchValue))
-                {
-                    searchValue = GetSearchValue();
-                    if (searchValue == "quit") return;
-                    if (searchValue == "back")
+                    if (tableOrView == "cache")
                     {
-                        tableOrView = "";
-                        break;
+                        await HandleCacheCommands();
+                        continue;
                     }
                 }
-                if (string.IsNullOrEmpty(tableOrView)) continue; // Go back to table selection
+                if (string.IsNullOrEmpty(database)) continue;
 
-                // Step 5: Confirm if production
-                if (environment.Equals("Prod", StringComparison.OrdinalIgnoreCase))
+                // Create new session
+                currentSession = new SearchSession
                 {
-                    if (!ConfirmProductionAccess(database, tableOrView))
-                    {
-                        WriteWarning("Operation cancelled. Starting over...");
-                        Console.WriteLine();
-                        continue; // Start over from the beginning
-                    }
-                }
+                    Environment = environment,
+                    Database = database,
+                    TableName = tableOrView
+                };
 
-                // Step 6: Perform search
-                Console.WriteLine();
-                SearchTable(environment, database, tableOrView, searchValue);
+                // Step 4: Initialize cache for this table
+                await InitializeTableCache(currentSession);
 
-                // Ask if user wants to search again
-                Console.WriteLine();
-                WriteHighlight("Would you like to perform another search? (y/n): ");
-                string again = Console.ReadLine()?.Trim() ?? "";
-                if (!again.Equals("y", StringComparison.OrdinalIgnoreCase) &&
-                    !again.Equals("yes", StringComparison.OrdinalIgnoreCase))
-                {
-                    break;
-                }
-                Console.WriteLine();
+                // Step 5: Perform first search
+                await PerformCachedSearch();
             }
         }
 
-        static void RunCommandLineMode(string[] args)
+        static async Task RunCommandLineMode(string[] args)
         {
             if (args.Length < 4)
             {
-                ShowUsage();
+                DisplayMessages.ShowUsageDisplay();
                 return;
             }
 
@@ -238,23 +227,606 @@ namespace DatabaseValueSearcher
             string searchValue = args[3];
             bool useRegex = args.Length > 4 && args[4].Equals("--regex", StringComparison.OrdinalIgnoreCase);
 
-            WriteInfo("============================================");
-            WriteInfo("DATABASE VALUE SEARCHER - COMMAND LINE MODE");
-            WriteInfo("============================================");
+            DisplayMessages.WriteInfo("============================================");
+            DisplayMessages.WriteInfo("DATABASE VALUE SEARCHER - COMMAND LINE MODE");
+            DisplayMessages.WriteInfo("============================================");
             Console.WriteLine($"Environment: {environment}");
             Console.WriteLine($"Database: {database}");
             Console.WriteLine($"Table: {tableName}");
             Console.WriteLine($"Search Value: {searchValue}");
-            if (useRegex) WriteHighlight("Search Type: Regular Expression");
-            WriteInfo("============================================");
+            if (useRegex) DisplayMessages.WriteHighlight("Search Type: Regular Expression");
+            DisplayMessages.WriteInfo("============================================");
             Console.WriteLine();
 
-            SearchTable(environment, database, tableName, searchValue, useRegex);
+            currentSession = new SearchSession
+            {
+                Environment = environment,
+                Database = database,
+                TableName = tableName
+            };
+
+            await InitializeTableCache(currentSession);
+            await SearchCachedTable(currentSession, searchValue, useRegex);
+        }
+
+        static async Task HandleCacheCommands()
+        {
+            Console.WriteLine();
+            DisplayMessages.WriteInfo("Cache Management Options:");
+            Console.WriteLine("  1. Show cache status");
+            Console.WriteLine("  2. Clear all cache");
+            Console.WriteLine("  3. Clear current table cache");
+            Console.WriteLine("  4. Cache statistics");
+            Console.WriteLine();
+
+            Console.Write("Select option (1-4) [back]: ");
+            string input = Console.ReadLine()?.Trim() ?? "";
+
+            switch (input)
+            {
+                case "1":
+                    ShowCacheStatus();
+                    break;
+                case "2":
+                    cacheManager.ClearCache();
+                    DisplayMessages.WriteSuccess("All cache cleared.");
+                    break;
+                case "3":
+                    if (currentSession != null)
+                    {
+                        var cacheKey = cacheManager.GetCacheKey(currentSession.Environment, currentSession.Database, currentSession.TableName);
+                        cacheManager.ClearCache(cacheKey);
+                        DisplayMessages.WriteSuccess($"Cache cleared for {currentSession.TableName}.");
+                    }
+                    else
+                    {
+                        DisplayMessages.WriteWarning("No active session to clear cache for.");
+                    }
+                    break;
+                case "4":
+                    ShowCacheStatistics();
+                    break;
+                case "back":
+                case "":
+                    break;
+                default:
+                    DisplayMessages.WriteError("Invalid option.");
+                    break;
+            }
+            Console.WriteLine();
+        }
+
+        static void ShowCacheStatus()
+        {
+            bool enableCaching = bool.Parse(ConfigurationManager.AppSettings["EnableCaching"] ?? "true");
+            if (!enableCaching)
+            {
+                DisplayMessages.WriteWarning("Caching is disabled.");
+                return;
+            }
+
+            var cacheSize = cacheManager.GetCacheSize();
+            DisplayMessages.WriteInfo($"Cache Status: Enabled | Size: {cacheSize / 1024 / 1024:F1} MB");
+        }
+
+        static void ShowCacheStatistics()
+        {
+            var cacheDirectory = ConfigurationManager.AppSettings["CacheDirectory"] ?? "./Cache";
+            if (!Directory.Exists(cacheDirectory))
+            {
+                DisplayMessages.WriteWarning("No cache directory found.");
+                return;
+            }
+
+            var files = Directory.GetFiles(cacheDirectory, "*", SearchOption.AllDirectories);
+            var totalSize = files.Sum(f => new FileInfo(f).Length);
+            var metadataFiles = files.Count(f => f.Contains("_metadata.json"));
+            var pageFiles = files.Count(f => f.Contains("_page_"));
+
+            Console.WriteLine();
+            DisplayMessages.WriteInfo("CACHE STATISTICS:");
+            Console.WriteLine($"  Total Files: {files.Length}");
+            Console.WriteLine($"  Metadata Files: {metadataFiles}");
+            Console.WriteLine($"  Data Page Files: {pageFiles}");
+            Console.WriteLine($"  Total Size: {totalSize / 1024 / 1024:F2} MB");
+            Console.WriteLine($"  Cache Directory: {cacheDirectory}");
+        }
+
+        static async Task InitializeTableCache(SearchSession session)
+        {
+            var cacheKey = cacheManager.GetCacheKey(session.Environment, session.Database, session.TableName);
+            var cachedData = cacheManager.LoadMetadata(cacheKey);
+
+            if (cachedData != null && cacheManager.IsCacheValid(cacheKey))
+            {
+                DisplayMessages.WriteSuccess($"Using cached data for {session.TableName} (cached {cachedData.CachedAt:yyyy-MM-dd HH:mm})");
+                session.CachedData = cachedData;
+                return;
+            }
+
+            DisplayMessages.WriteInfo($"Initializing cache for {session.TableName}...");
+
+            // Get fresh metadata from database
+            var connectionString = GetFullConnectionString(session.Environment, session.Database);
+
+            await performanceManager.ExecuteWithThrottling(async () =>
+            {
+                using var conn = new SqlConnection(connectionString);
+                await conn.OpenAsync();
+                performanceManager.ConfigureConnection(conn);
+
+                var metadata = new CachedTableData
+                {
+                    Environment = session.Environment,
+                    Database = session.Database,
+                    TableName = session.TableName,
+                    CachedAt = DateTime.Now,
+                    PageSize = int.Parse(ConfigurationManager.AppSettings["PageSize"] ?? "10000")
+                };
+
+                // Get table structure
+                metadata.Columns = await GetStringColumnsAsync(conn, session.TableName);
+                metadata.PrimaryKeys = await GetPrimaryKeyColumnsAsync(conn, session.TableName);
+
+                // Get total row count
+                var countSql = $"SELECT COUNT(*) FROM [{session.TableName}]";
+                using var countCmd = new SqlCommand(countSql, conn);
+                performanceManager.ConfigureCommand(countCmd);
+                metadata.TotalRows = Convert.ToInt64(await countCmd.ExecuteScalarAsync());
+
+                session.CachedData = metadata;
+                cacheManager.SaveMetadata(cacheKey, metadata);
+
+                DisplayMessages.WriteSuccess($"Table metadata cached. Total rows: {metadata.TotalRows:N0}, Columns: {metadata.Columns.Count}");
+                return true;
+            });
+        }
+
+        static async Task RefreshCurrentTable()
+        {
+            if (currentSession == null) return;
+
+            DisplayMessages.WriteInfo("Refreshing table data...");
+            var cacheKey = cacheManager.GetCacheKey(currentSession.Environment, currentSession.Database, currentSession.TableName);
+            cacheManager.ClearCache(cacheKey);
+            await InitializeTableCache(currentSession);
+            DisplayMessages.WriteSuccess("Table data refreshed.");
+        }
+
+        static async Task PerformCachedSearch()
+        {
+            if (currentSession?.CachedData == null)
+            {
+                DisplayMessages.WriteError("No cached data available. Please initialize table first.");
+                return;
+            }
+
+            string searchValue = GetSearchValue();
+            if (searchValue == "quit" || searchValue == "back") return;
+
+            bool useRegex = searchValue.StartsWith("REGEX:");
+            if (useRegex) searchValue = searchValue.Substring(6);
+
+            await SearchCachedTable(currentSession, searchValue, useRegex);
+        }
+
+        static async Task SearchCachedTable(SearchSession session, string searchValue, bool useRegex)
+        {
+            if (session.CachedData == null)
+            {
+                DisplayMessages.WriteError("No cached data available.");
+                return;
+            }
+
+            DisplayMessages.WriteInfo($"Searching {session.TableName} with cached data...");
+            DisplayMessages.WriteInfo($"Search Type: {(useRegex ? "Regular Expression" : "LIKE Pattern")}");
+            DisplayMessages.WriteInfo($"Primary Keys: {string.Join(", ", session.CachedData.PrimaryKeys)}");
+            Console.WriteLine();
+
+            var stopwatch = Stopwatch.StartNew();
+            var allMatches = new List<MatchingRecord>();
+            var cacheKey = cacheManager.GetCacheKey(session.Environment, session.Database, session.TableName);
+
+            // Calculate total pages
+            var totalPages = (int)Math.Ceiling((double)session.CachedData.TotalRows / session.CachedData.PageSize);
+            var pagesProcessed = 0;
+            var matchesFound = 0;
+
+            DisplayMessages.WriteInfo($"Processing {totalPages} pages ({session.CachedData.PageSize:N0} rows per page)...");
+
+            // Process each page
+            for (int pageNum = 1; pageNum <= totalPages; pageNum++)
+            {
+                // Load page from cache or database
+                var page = await LoadOrFetchPage(session, pageNum);
+                if (page == null || !page.Rows.Any()) continue;
+
+                // Search this page in memory
+                var pageMatches = SearchPageInMemory(page, session.CachedData.Columns, session.CachedData.PrimaryKeys, searchValue, useRegex);
+                allMatches.AddRange(pageMatches);
+                matchesFound += pageMatches.Count;
+                pagesProcessed++;
+
+                // Show progress for large tables
+                if (totalPages > 10 && pageNum % Math.Max(1, totalPages / 10) == 0)
+                {
+                    var progress = (double)pageNum / totalPages * 100;
+                    DisplayMessages.WriteInfo($"Progress: {progress:F1}% ({pageNum}/{totalPages} pages) - {matchesFound:N0} matches found");
+                }
+
+                // Memory management
+                var gcPages = int.Parse(ConfigurationManager.AppSettings["GarbageCollectAfterPages"] ?? "50");
+                if (pageNum % gcPages == 0)
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                }
+            }
+
+            stopwatch.Stop();
+
+            // Display results
+            DisplaySearchResults(session, allMatches, searchValue, useRegex, stopwatch.ElapsedMilliseconds, pagesProcessed);
+        }
+
+        static async Task<DataPage?> LoadOrFetchPage(SearchSession session, int pageNumber)
+        {
+            var cacheKey = cacheManager.GetCacheKey(session.Environment, session.Database, session.TableName);
+
+            // Try to load from cache first
+            var cachedPage = cacheManager.LoadPage(cacheKey, pageNumber);
+            if (cachedPage != null)
+            {
+                return cachedPage;
+            }
+
+            // Fetch from database if not cached
+            return await FetchPageFromDatabase(session, pageNumber);
+        }
+
+        static async Task<DataPage?> FetchPageFromDatabase(SearchSession session, int pageNumber)
+        {
+            if (session.CachedData == null) return null;
+
+            var connectionString = GetFullConnectionString(session.Environment, session.Database);
+            var cacheKey = cacheManager.GetCacheKey(session.Environment, session.Database, session.TableName);
+
+            return await performanceManager.ExecuteWithThrottling(async () =>
+            {
+                using var conn = new SqlConnection(connectionString);
+                await conn.OpenAsync();
+                performanceManager.ConfigureConnection(conn);
+
+                var offset = (pageNumber - 1) * session.CachedData.PageSize;
+                var allColumns = new List<string>(session.CachedData.Columns.Select(c => c.Name));
+                allColumns.AddRange(session.CachedData.PrimaryKeys.Where(pk => !allColumns.Contains(pk)));
+
+                var sql = $@"
+                    SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))}
+                    FROM [{session.TableName}]
+                    ORDER BY {string.Join(", ", session.CachedData.PrimaryKeys.Select(pk => $"[{pk}]"))}
+                    OFFSET {offset} ROWS
+                    FETCH NEXT {session.CachedData.PageSize} ROWS ONLY";
+
+                using var cmd = new SqlCommand(sql, conn);
+                performanceManager.ConfigureCommand(cmd);
+
+                var page = new DataPage
+                {
+                    PageNumber = pageNumber,
+                    Rows = new List<Dictionary<string, object?>>()
+                };
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    var row = new Dictionary<string, object?>();
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        var columnName = reader.GetName(i);
+                        var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        row[columnName] = value;
+                    }
+                    page.Rows.Add(row);
+                }
+
+                page.IsLastPage = page.Rows.Count < session.CachedData.PageSize;
+
+                // Cache the page
+                cacheManager.SavePage(cacheKey, pageNumber, page);
+
+                return page;
+            });
+        }
+
+        static List<MatchingRecord> SearchPageInMemory(DataPage page, List<ColumnInfo> columns, List<string> primaryKeys, string searchValue, bool useRegex)
+        {
+            var matches = new List<MatchingRecord>();
+            Regex? regex = null;
+
+            if (useRegex)
+            {
+                try
+                {
+                    regex = new Regex(searchValue, RegexOptions.IgnoreCase);
+                }
+                catch
+                {
+                    return matches; // Invalid regex
+                }
+            }
+
+            foreach (var row in page.Rows)
+            {
+                foreach (var column in columns)
+                {
+                    if (!row.TryGetValue(column.Name, out var value) || value == null) continue;
+
+                    var stringValue = value.ToString() ?? "";
+                    bool isMatch = false;
+
+                    if (useRegex && regex != null)
+                    {
+                        isMatch = regex.IsMatch(stringValue);
+                    }
+                    else
+                    {
+                        // SQL LIKE behavior
+                        isMatch = IsLikeMatch(stringValue, searchValue);
+                    }
+
+                    if (isMatch)
+                    {
+                        var match = new MatchingRecord
+                        {
+                            ColumnName = column.Name,
+                            MatchingValue = stringValue
+                        };
+
+                        // Get primary key values
+                        foreach (var pkColumn in primaryKeys)
+                        {
+                            if (row.TryGetValue(pkColumn, out var pkValue))
+                            {
+                                match.PrimaryKeyValues[pkColumn] = pkValue?.ToString() ?? "<NULL>";
+                            }
+                        }
+
+                        matches.Add(match);
+                    }
+                }
+            }
+
+            return matches;
+        }
+
+        static bool IsLikeMatch(string text, string pattern)
+        {
+            // Convert SQL LIKE pattern to regex
+            var regexPattern = "^" + Regex.Escape(pattern)
+                .Replace("\\%", ".*")
+                .Replace("\\_", ".") + "$";
+
+            try
+            {
+                return Regex.IsMatch(text, regexPattern, RegexOptions.IgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static void DisplaySearchResults(SearchSession session, List<MatchingRecord> allMatches, string searchValue, bool useRegex, long searchTimeMs, int pagesProcessed)
+        {
+            DisplayMessages.WriteInfo("============================================");
+            DisplayMessages.WriteInfo("SEARCH RESULTS:");
+            DisplayMessages.WriteInfo("============================================");
+
+            if (session.CachedData == null) return;
+
+            Console.WriteLine($"  Environment: {environments.GetValueOrDefault(session.Environment, session.Environment)}");
+            Console.WriteLine($"  Database: {session.Database}");
+            Console.WriteLine($"  Table: {session.TableName}");
+            Console.WriteLine($"  Search Value: {searchValue}");
+            Console.WriteLine($"  Search Type: {(useRegex ? "Regular Expression" : "LIKE Pattern")}");
+            Console.WriteLine($"  Pages Processed: {pagesProcessed:N0}");
+            Console.WriteLine($"  Search Method: Cached Data");
+
+            var columnGroups = allMatches.GroupBy(m => m.ColumnName).ToList();
+
+            DisplayMessages.WriteColoredInline("  Columns with Matches: ", ConsoleColor.Green);
+            Console.WriteLine(columnGroups.Count.ToString());
+
+            DisplayMessages.WriteColoredInline("  Total Matches: ", ConsoleColor.Yellow);
+            Console.WriteLine($"{allMatches.Count:N0}");
+
+            Console.WriteLine($"  Search Time: {searchTimeMs:N0} ms");
+
+            if (columnGroups.Any())
+            {
+                Console.WriteLine();
+                DisplayMessages.WriteInfo("COLUMN RESULTS:");
+                DisplayMessages.WriteInfo("----------------------------------------");
+
+                foreach (var group in columnGroups.OrderByDescending(g => g.Count()))
+                {
+                    DisplayMessages.WriteColoredInline("✓ Column: ", ConsoleColor.Green);
+                    DisplayMessages.WriteColoredInline(group.Key, ConsoleColor.White);
+                    Console.WriteLine();
+
+                    var columnInfo = session.CachedData.Columns.FirstOrDefault(c => c.Name == group.Key);
+                    if (columnInfo != null)
+                    {
+                        Console.WriteLine($"  Type: {columnInfo.DataType}({GetLengthDisplay(columnInfo.MaxLength)}) {(columnInfo.IsNullable ? "NULL" : "NOT NULL")}");
+                    }
+
+                    DisplayMessages.WriteColoredInline("  Matches: ", ConsoleColor.Cyan);
+                    DisplayMessages.WriteColoredInline($"{group.Count():N0}", ConsoleColor.Yellow);
+                    Console.WriteLine();
+
+                    // Show sample matches
+                    DisplayMessages.WriteColoredInline("  Sample Matches:", ConsoleColor.Magenta);
+                    Console.WriteLine();
+
+                    int maxSamples = int.Parse(ConfigurationManager.AppSettings["DefaultMaxSamples"] ?? "3");
+                    var samples = group.Take(maxSamples).ToList();
+
+                    foreach (var match in samples)
+                    {
+                        DisplayMessages.WriteColoredInline("    • ", ConsoleColor.Gray);
+                        DisplayMessages.WriteColoredInline($"{match.ColumnName}: ", ConsoleColor.Cyan);
+
+                        var displayValue = match.MatchingValue;
+                        int maxLength = int.Parse(ConfigurationManager.AppSettings["MaxDisplayLength"] ?? "50");
+                        if (displayValue.Length > maxLength)
+                        {
+                            displayValue = displayValue.Substring(0, maxLength - 3) + "...";
+                        }
+
+                        DisplayMessages.WriteColoredInline($"'{displayValue}'", ConsoleColor.Yellow);
+
+                        if (match.PrimaryKeyValues.Any())
+                        {
+                            DisplayMessages.WriteColoredInline(" | Keys: ", ConsoleColor.Magenta);
+                            var keyPairs = match.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}");
+                            Console.Write(string.Join(", ", keyPairs));
+                        }
+                        Console.WriteLine();
+                    }
+
+                    if (group.Count() > maxSamples)
+                    {
+                        DisplayMessages.WriteColoredInline($"    ... and {group.Count() - maxSamples:N0} more matches", ConsoleColor.Gray);
+                        Console.WriteLine();
+                    }
+                    Console.WriteLine();
+                }
+
+                // Unique records summary
+                var uniqueRecords = allMatches
+                    .GroupBy(r => string.Join("|", r.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}")))
+                    .ToList();
+
+                Console.WriteLine();
+                DisplayMessages.WriteInfo("UNIQUE RECORDS SUMMARY:");
+                DisplayMessages.WriteInfo("----------------------------------------");
+
+                var recordsToShow = uniqueRecords.Take(10).ToList();
+                foreach (var recordGroup in recordsToShow)
+                {
+                    var record = recordGroup.First();
+                    DisplayMessages.WriteColoredInline("  Record: ", ConsoleColor.Green);
+
+                    if (record.PrimaryKeyValues.Any())
+                    {
+                        var keyPairs = record.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}");
+                        Console.WriteLine(string.Join(", ", keyPairs));
+
+                        DisplayMessages.WriteColoredInline("    Found in: ", ConsoleColor.Cyan);
+                        var columns = recordGroup.Select(r => r.ColumnName).Distinct();
+                        Console.WriteLine(string.Join(", ", columns));
+                    }
+                    else
+                    {
+                        Console.WriteLine("(No primary key available)");
+                    }
+                }
+
+                if (uniqueRecords.Count > 10)
+                {
+                    DisplayMessages.WriteColoredInline($"  ... and {uniqueRecords.Count - 10:N0} more unique records", ConsoleColor.Gray);
+                    Console.WriteLine();
+                }
+
+                Console.WriteLine();
+                DisplayMessages.WriteColoredInline("  Total Unique Records: ", ConsoleColor.Magenta);
+                Console.WriteLine($"{uniqueRecords.Count:N0}");
+            }
+            else
+            {
+                Console.WriteLine();
+                DisplayMessages.WriteWarning("No matches found in any column.");
+                DisplayMessages.WriteHighlight("Tips:");
+                Console.WriteLine("- Try using wildcards: %search_term%");
+                Console.WriteLine("- Check your search term spelling");
+                Console.WriteLine("- Consider using regular expressions for complex patterns");
+            }
+
+            DisplayMessages.WriteInfo("============================================");
+        }
+
+        static async Task<List<ColumnInfo>> GetStringColumnsAsync(SqlConnection conn, string tableName)
+        {
+            var columns = new List<ColumnInfo>();
+
+            string sql = @"
+                SELECT COLUMN_NAME, DATA_TYPE, 
+                       ISNULL(CHARACTER_MAXIMUM_LENGTH, 0) as MaxLength,
+                       IS_NULLABLE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = @TableName
+                  AND DATA_TYPE IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
+                ORDER BY ORDINAL_POSITION";
+
+            using var cmd = new SqlCommand(sql, conn);
+            performanceManager.ConfigureCommand(cmd);
+            cmd.Parameters.AddWithValue("@TableName", tableName);
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var column = new ColumnInfo
+                {
+                    Name = reader["COLUMN_NAME"]?.ToString() ?? string.Empty,
+                    DataType = reader["DATA_TYPE"]?.ToString() ?? string.Empty,
+                    MaxLength = Convert.ToInt32(reader["MaxLength"] ?? 0),
+                    IsNullable = (reader["IS_NULLABLE"]?.ToString() ?? "NO") == "YES"
+                };
+                columns.Add(column);
+            }
+
+            return columns;
+        }
+
+        static async Task<List<string>> GetPrimaryKeyColumnsAsync(SqlConnection conn, string tableName)
+        {
+            var primaryKeys = new List<string>();
+
+            string sql = @"
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+                  AND TABLE_NAME = @TableName
+                ORDER BY ORDINAL_POSITION";
+
+            try
+            {
+                using var cmd = new SqlCommand(sql, conn);
+                performanceManager.ConfigureCommand(cmd);
+                cmd.Parameters.AddWithValue("@TableName", tableName);
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    string columnName = reader["COLUMN_NAME"]?.ToString() ?? "";
+                    if (!string.IsNullOrEmpty(columnName))
+                    {
+                        primaryKeys.Add(columnName);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DisplayMessages.WriteWarning($"Could not retrieve primary key information: {ex.Message}");
+            }
+
+            return primaryKeys;
         }
 
         static string SelectEnvironment()
         {
-            WriteInfo("Available Environments:");
+            DisplayMessages.WriteInfo("Available Environments:");
             var envList = environments.ToList();
 
             for (int i = 0; i < envList.Count; i++)
@@ -263,7 +835,7 @@ namespace DatabaseValueSearcher
                 if (indicator != "")
                 {
                     Console.Write($"  {i + 1}. {envList[i].Value}");
-                    WriteColoredInline(indicator, ConsoleColor.Red);
+                    DisplayMessages.WriteColoredInline(indicator, ConsoleColor.Red);
                     Console.WriteLine();
                 }
                 else
@@ -274,44 +846,40 @@ namespace DatabaseValueSearcher
 
             while (true)
             {
-                Console.Write($"Select environment (1-{envList.Count}) [back/quit]: ");
+                Console.Write($"Select environment (1-{envList.Count}) [cache/quit]: ");
                 string input = Console.ReadLine()?.Trim() ?? "";
 
                 if (input.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
-                if (input.Equals("back", StringComparison.OrdinalIgnoreCase))
-                {
-                    WriteWarning("Already at the first step.");
-                    continue;
-                }
+                if (input.Equals("cache", StringComparison.OrdinalIgnoreCase)) return "cache";
 
                 if (int.TryParse(input, out int selection) && selection >= 1 && selection <= envList.Count)
                 {
                     string selectedEnv = envList[selection - 1].Key;
-                    WriteSuccess($"Selected: {environments[selectedEnv]}");
+                    DisplayMessages.WriteSuccess($"Selected: {environments[selectedEnv]}");
                     Console.WriteLine();
                     return selectedEnv;
                 }
 
-                WriteError("Invalid selection. Please try again.");
+                DisplayMessages.WriteError("Invalid selection. Please try again.");
             }
         }
 
-        static string SelectDatabase(string environment)
+        static async Task<string> SelectDatabase(string environment)
         {
             try
             {
                 string baseConnectionString = GetBaseConnectionString(environment);
-                var databases = GetDatabaseList(baseConnectionString);
+                var databases = await GetDatabaseListAsync(baseConnectionString);
 
                 if (databases.Count == 0)
                 {
-                    WriteError("No databases found or unable to access database list.");
-                    WriteWarning("Press any key to go back...");
+                    DisplayMessages.WriteError("No databases found or unable to access database list.");
+                    DisplayMessages.WriteWarning("Press any key to go back...");
                     Console.ReadKey();
                     return "back";
                 }
 
-                WriteInfo("Available Databases:");
+                DisplayMessages.WriteInfo("Available Databases:");
                 for (int i = 0; i < databases.Count; i++)
                 {
                     Console.WriteLine($"  {i + 1}. {databases[i]}");
@@ -319,39 +887,42 @@ namespace DatabaseValueSearcher
 
                 while (true)
                 {
-                    Console.Write($"Select database (1-{databases.Count}) [back/quit]: ");
+                    Console.Write($"Select database (1-{databases.Count}) [back/cache/quit]: ");
                     string input = Console.ReadLine()?.Trim() ?? "";
 
                     if (input.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
                     if (input.Equals("back", StringComparison.OrdinalIgnoreCase)) return "back";
+                    if (input.Equals("cache", StringComparison.OrdinalIgnoreCase)) return "cache";
 
                     if (int.TryParse(input, out int selection) && selection >= 1 && selection <= databases.Count)
                     {
                         string selectedDb = databases[selection - 1];
-                        WriteSuccess($"Selected: {selectedDb}");
+                        DisplayMessages.WriteSuccess($"Selected: {selectedDb}");
                         Console.WriteLine();
                         return selectedDb;
                     }
 
-                    WriteError("Invalid selection. Please try again.");
+                    DisplayMessages.WriteError("Invalid selection. Please try again.");
                 }
             }
             catch (Exception ex)
             {
-                WriteError($"Error retrieving database list: {ex.Message}");
-                WriteWarning("Press any key to go back...");
+                DisplayMessages.WriteError($"Error retrieving database list: {ex.Message}");
+                DisplayMessages.WriteWarning("Press any key to go back...");
                 Console.ReadKey();
                 return "back";
             }
         }
 
-        static List<string> GetDatabaseList(string baseConnectionString)
+        static async Task<List<string>> GetDatabaseListAsync(string baseConnectionString)
         {
             var databases = new List<string>();
 
-            using (var conn = new SqlConnection(baseConnectionString))
+            await performanceManager.ExecuteWithThrottling(async () =>
             {
-                conn.Open();
+                using var conn = new SqlConnection(baseConnectionString);
+                await conn.OpenAsync();
+                performanceManager.ConfigureConnection(conn);
 
                 string sql = @"
                     SELECT name 
@@ -360,36 +931,35 @@ namespace DatabaseValueSearcher
                       AND name NOT IN ('master', 'tempdb', 'model', 'msdb')
                     ORDER BY name";
 
-                using (var cmd = new SqlCommand(sql, conn))
+                using var cmd = new SqlCommand(sql, conn);
+                performanceManager.ConfigureCommand(cmd);
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
                 {
-                    using (var reader = cmd.ExecuteReader())
+                    string dbName = reader["name"]?.ToString() ?? "";
+                    if (!string.IsNullOrEmpty(dbName))
                     {
-                        while (reader.Read())
-                        {
-                            string dbName = reader["name"]?.ToString() ?? "";
-                            if (!string.IsNullOrEmpty(dbName))
-                            {
-                                databases.Add(dbName);
-                            }
-                        }
+                        databases.Add(dbName);
                     }
                 }
-            }
+                return true;
+            });
 
             return databases;
         }
 
-        static string SelectTableOrView(string environment, string database)
+        static async Task<string> SelectTableOrView(string environment, string database)
         {
             try
             {
                 string connectionString = GetFullConnectionString(environment, database);
-                var tablesAndViews = GetTablesAndViews(connectionString);
+                var tablesAndViews = await GetTablesAndViewsAsync(connectionString);
 
                 if (tablesAndViews.Count == 0)
                 {
-                    WriteError("No tables or views found in the database.");
-                    WriteWarning("Press any key to go back...");
+                    DisplayMessages.WriteError("No tables or views found in the database.");
+                    DisplayMessages.WriteWarning("Press any key to go back...");
                     Console.ReadKey();
                     return "back";
                 }
@@ -398,11 +968,12 @@ namespace DatabaseValueSearcher
 
                 while (true)
                 {
-                    Console.Write($"Select table/view (1-{tablesAndViews.Count}) [f=filter, back/quit]: ");
+                    Console.Write($"Select table/view (1-{tablesAndViews.Count}) [f=filter, back/cache/quit]: ");
                     string input = Console.ReadLine()?.Trim() ?? "";
 
                     if (input.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
                     if (input.Equals("back", StringComparison.OrdinalIgnoreCase)) return "back";
+                    if (input.Equals("cache", StringComparison.OrdinalIgnoreCase)) return "cache";
 
                     // Handle filter option
                     if (input.Equals("f", StringComparison.OrdinalIgnoreCase))
@@ -419,18 +990,18 @@ namespace DatabaseValueSearcher
                     if (int.TryParse(input, out int selection) && selection >= 1 && selection <= tablesAndViews.Count)
                     {
                         var selected = tablesAndViews[selection - 1];
-                        WriteSuccess($"Selected: {selected.Name} ({(selected.Type == "T" ? "Table" : "View")})");
+                        DisplayMessages.WriteSuccess($"Selected: {selected.Name} ({(selected.Type == "T" ? "Table" : "View")})");
                         Console.WriteLine();
                         return selected.Name;
                     }
 
-                    WriteError("Invalid selection. Please try again.");
+                    DisplayMessages.WriteError("Invalid selection. Please try again.");
                 }
             }
             catch (Exception ex)
             {
-                WriteError($"Error retrieving tables and views: {ex.Message}");
-                WriteWarning("Press any key to go back...");
+                DisplayMessages.WriteError($"Error retrieving tables and views: {ex.Message}");
+                DisplayMessages.WriteWarning("Press any key to go back...");
                 Console.ReadKey();
                 return "back";
             }
@@ -438,8 +1009,8 @@ namespace DatabaseValueSearcher
 
         static void DisplayTablesAndViews(List<TableViewInfo> tablesAndViews)
         {
-            WriteInfo("Available Tables and Views:");
-            WriteHighlight("(T = Table, V = View)");
+            DisplayMessages.WriteInfo("Available Tables and Views:");
+            DisplayMessages.WriteHighlight("(T = Table, V = View)");
             Console.WriteLine();
 
             // Group by type for better display
@@ -450,12 +1021,12 @@ namespace DatabaseValueSearcher
 
             if (tables.Count > 0)
             {
-                WriteColoredInline("TABLES:", ConsoleColor.Green);
+                DisplayMessages.WriteColoredInline("TABLES:", ConsoleColor.Green);
                 Console.WriteLine();
                 foreach (var table in tables)
                 {
                     Console.Write($"  {counter}. ");
-                    WriteColoredInline("[T]", ConsoleColor.Green);
+                    DisplayMessages.WriteColoredInline("[T]", ConsoleColor.Green);
                     Console.WriteLine($" {table.Name} ({table.RowCount:N0} rows)");
                     counter++;
                 }
@@ -464,12 +1035,12 @@ namespace DatabaseValueSearcher
 
             if (views.Count > 0)
             {
-                WriteColoredInline("VIEWS:", ConsoleColor.Blue);
+                DisplayMessages.WriteColoredInline("VIEWS:", ConsoleColor.Blue);
                 Console.WriteLine();
                 foreach (var view in views)
                 {
                     Console.Write($"  {counter}. ");
-                    WriteColoredInline("[V]", ConsoleColor.Blue);
+                    DisplayMessages.WriteColoredInline("[V]", ConsoleColor.Blue);
                     Console.WriteLine($" {view.Name}");
                     counter++;
                 }
@@ -489,7 +1060,7 @@ namespace DatabaseValueSearcher
 
                 if (string.IsNullOrEmpty(filter))
                 {
-                    WriteWarning("No filter provided. Please try again.");
+                    DisplayMessages.WriteWarning("No filter provided. Please try again.");
                     continue;
                 }
 
@@ -498,17 +1069,17 @@ namespace DatabaseValueSearcher
 
                 if (filtered.Count == 0)
                 {
-                    WriteError($"No tables or views found matching '{filter}'. Try again.");
+                    DisplayMessages.WriteError($"No tables or views found matching '{filter}'. Try again.");
                     continue;
                 }
 
-                WriteInfo($"Filtered Results (containing '{filter}'):");
+                DisplayMessages.WriteInfo($"Filtered Results (containing '{filter}'):");
                 for (int i = 0; i < filtered.Count; i++)
                 {
                     var item = filtered[i];
                     string rowInfo = item.Type == "T" ? $" ({item.RowCount:N0} rows)" : "";
                     Console.Write($"  {i + 1}. ");
-                    WriteColoredInline($"[{item.Type}]", item.Type == "T" ? ConsoleColor.Green : ConsoleColor.Blue);
+                    DisplayMessages.WriteColoredInline($"[{item.Type}]", item.Type == "T" ? ConsoleColor.Green : ConsoleColor.Blue);
                     Console.WriteLine($" {item.Name}{rowInfo}");
                 }
 
@@ -523,23 +1094,25 @@ namespace DatabaseValueSearcher
                     if (int.TryParse(input, out int selection) && selection >= 1 && selection <= filtered.Count)
                     {
                         var selected = filtered[selection - 1];
-                        WriteSuccess($"Selected: {selected.Name} ({(selected.Type == "T" ? "Table" : "View")})");
+                        DisplayMessages.WriteSuccess($"Selected: {selected.Name} ({(selected.Type == "T" ? "Table" : "View")})");
                         Console.WriteLine();
                         return selected.Name;
                     }
 
-                    WriteError("Invalid selection. Please try again.");
+                    DisplayMessages.WriteError("Invalid selection. Please try again.");
                 }
             }
         }
 
-        static List<TableViewInfo> GetTablesAndViews(string connectionString)
+        static async Task<List<TableViewInfo>> GetTablesAndViewsAsync(string connectionString)
         {
             var items = new List<TableViewInfo>();
 
-            using (var conn = new SqlConnection(connectionString))
+            await performanceManager.ExecuteWithThrottling(async () =>
             {
-                conn.Open();
+                using var conn = new SqlConnection(connectionString);
+                await conn.OpenAsync();
+                performanceManager.ConfigureConnection(conn);
 
                 // Simplified query that should work on all SQL Server versions
                 string sql = @"
@@ -556,40 +1129,48 @@ namespace DatabaseValueSearcher
                       AND t.TABLE_SCHEMA = 'dbo'
                     ORDER BY t.TABLE_TYPE, t.TABLE_NAME";
 
-                using (var cmd = new SqlCommand(sql, conn))
+                using var cmd = new SqlCommand(sql, conn);
+                performanceManager.ConfigureCommand(cmd);
+
+                using var reader = await cmd.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
                 {
-                    using (var reader = cmd.ExecuteReader())
+                    var item = new TableViewInfo
                     {
-                        while (reader.Read())
-                        {
-                            var item = new TableViewInfo
-                            {
-                                Name = reader["Name"]?.ToString() ?? "",
-                                Type = reader["Type"]?.ToString() ?? "O",
-                                RowCount = 0 // We'll get row count separately for tables only
-                            };
-                            items.Add(item);
-                        }
-                    }
+                        Name = reader["Name"]?.ToString() ?? "",
+                        Type = reader["Type"]?.ToString() ?? "O",
+                        RowCount = 0 // We'll get row count separately for tables only
+                    };
+                    items.Add(item);
                 }
 
-                // Get row counts for tables only (separate query to avoid complex joins)
-                foreach (var item in items.Where(i => i.Type == "T"))
+                return true;
+            });
+
+            // Get row counts for tables only (separate queries to avoid complex joins)
+            foreach (var item in items.Where(i => i.Type == "T"))
+            {
+                try
                 {
-                    try
+                    await performanceManager.ExecuteWithThrottling(async () =>
                     {
+                        using var conn = new SqlConnection(connectionString);
+                        await conn.OpenAsync();
+                        performanceManager.ConfigureConnection(conn);
+
                         string countSql = $"SELECT COUNT(*) FROM [{item.Name}]";
-                        using (var cmd = new SqlCommand(countSql, conn))
-                        {
-                            var result = cmd.ExecuteScalar();
-                            item.RowCount = Convert.ToInt64(result ?? 0);
-                        }
-                    }
-                    catch
-                    {
-                        // If we can't get row count, just leave it as 0
-                        item.RowCount = 0;
-                    }
+                        using var cmd = new SqlCommand(countSql, conn);
+                        performanceManager.ConfigureCommand(cmd);
+
+                        var result = await cmd.ExecuteScalarAsync();
+                        item.RowCount = Convert.ToInt64(result ?? 0);
+                        return true;
+                    });
+                }
+                catch
+                {
+                    // If we can't get row count, just leave it as 0
+                    item.RowCount = 0;
                 }
             }
 
@@ -598,31 +1179,7 @@ namespace DatabaseValueSearcher
 
         static string GetSearchValue()
         {
-            WriteInfo("Enter search value:");
-            Console.WriteLine();
-            WriteHighlight("Search Type Options:");
-            Console.WriteLine("  1. LIKE Pattern (default) - Uses SQL LIKE with wildcards");
-            Console.WriteLine("  2. Regular Expression - Uses .NET regex patterns");
-            Console.WriteLine();
-
-            WriteHighlight("LIKE Pattern Examples:");
-            Console.WriteLine("  john          - Exact match for 'john'");
-            Console.WriteLine("  %john         - Ends with 'john' (e.g., 'mjohn', 'datajohn')");
-            Console.WriteLine("  john%         - Starts with 'john' (e.g., 'johnson', 'johnny')");
-            Console.WriteLine("  %john%        - Contains 'john' anywhere (e.g., 'johnson', 'mjohnson')");
-            Console.WriteLine("  j_hn          - 'j' + any single character + 'hn' (e.g., 'john', 'jahn')");
-            Console.WriteLine("  %@%.com       - Contains '@' and ends with '.com' (emails)");
-            Console.WriteLine();
-
-            WriteHighlight("Regular Expression Examples:");
-            Console.WriteLine("  ^john$        - Exact match for 'john'");
-            Console.WriteLine("  john.*        - Starts with 'john'");
-            Console.WriteLine("  .*john        - Ends with 'john'");
-            Console.WriteLine("  .*john.*      - Contains 'john' anywhere");
-            Console.WriteLine("  j.hn          - 'j' + any single character + 'hn'");
-            Console.WriteLine("  \\d{3}-\\d{3}-\\d{4} - Phone number pattern (123-456-7890)");
-            Console.WriteLine("  [a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,} - Email pattern");
-            Console.WriteLine();
+            DisplayMessages.SearchValuesDisplay();
 
             while (true)
             {
@@ -639,7 +1196,7 @@ namespace DatabaseValueSearcher
                 }
                 else if (typeInput != "1" && !string.IsNullOrEmpty(typeInput) && !typeInput.Equals("like", StringComparison.OrdinalIgnoreCase))
                 {
-                    WriteError("Invalid selection. Please choose 1 for LIKE or 2 for REGEX.");
+                    DisplayMessages.WriteError("Invalid selection. Please choose 1 for LIKE or 2 for REGEX.");
                     continue;
                 }
 
@@ -649,66 +1206,44 @@ namespace DatabaseValueSearcher
                     string searchValue = Console.ReadLine()?.Trim() ?? "";
 
                     if (searchValue.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
-                    if (searchValue.Equals("back", StringComparison.OrdinalIgnoreCase)) break; // Back to search type selection
+                    if (searchValue.Equals("back", StringComparison.OrdinalIgnoreCase)) break;
 
                     if (string.IsNullOrEmpty(searchValue))
                     {
-                        WriteError("Search value is required. Please try again.");
+                        DisplayMessages.WriteError("Search value is required. Please try again.");
                         continue;
                     }
 
-                    // Validate regex pattern if using regex
                     if (useRegex)
                     {
                         try
                         {
                             var regex = new Regex(searchValue, RegexOptions.IgnoreCase);
-                            WriteSuccess($"Using regular expression: {searchValue}");
+                            DisplayMessages.WriteSuccess($"Using regular expression: {searchValue}");
                             return $"REGEX:{searchValue}";
                         }
                         catch (ArgumentException ex)
                         {
-                            WriteError($"Invalid regular expression: {ex.Message}");
-                            WriteWarning("Please correct the regex pattern or try again.");
+                            DisplayMessages.WriteError($"Invalid regular expression: {ex.Message}");
                             continue;
                         }
                     }
                     else
                     {
-                        // Show what pattern will be used for LIKE
-                        Console.WriteLine();
-                        if (searchValue.Contains('%') || searchValue.Contains('_'))
-                        {
-                            WriteSuccess($"Using LIKE pattern: {searchValue}");
-                        }
-                        else
-                        {
-                            WriteSuccess($"Using exact match: {searchValue}");
-                            WriteHighlight($"Tip: Add % wildcards for broader matching (e.g., %{searchValue}%)");
-                        }
+                        DisplayMessages.WriteSuccess($"Using LIKE pattern: {searchValue}");
                         return searchValue;
                     }
                 }
             }
         }
 
-        static bool ConfirmProductionAccess(string database, string tableName)
+        
+
+        static string GetLengthDisplay(int maxLength)
         {
-            string requireConfirmation = ConfigurationManager.AppSettings["RequireConfirmationForProd"] ?? "true";
-            if (!bool.Parse(requireConfirmation))
-            {
-                return true;
-            }
-
-            Console.WriteLine();
-            WriteError("⚠️  WARNING: You are about to access PRODUCTION environment!");
-            Console.WriteLine($"   Database: {database}");
-            Console.WriteLine($"   Table: {tableName}");
-            Console.WriteLine();
-            Console.Write("Are you sure you want to continue? (type 'YES' to confirm): ");
-
-            string confirmation = Console.ReadLine()?.Trim() ?? "";
-            return confirmation.Equals("YES", StringComparison.Ordinal);
+            if (maxLength == -1) return "MAX";
+            if (maxLength == 0) return "?";
+            return maxLength.ToString();
         }
 
         static string GetBaseConnectionString(string environment)
@@ -725,493 +1260,12 @@ namespace DatabaseValueSearcher
         {
             string baseConnectionString = GetBaseConnectionString(environment);
 
-            // Add database to connection string
             var builder = new SqlConnectionStringBuilder(baseConnectionString)
             {
                 InitialCatalog = database
             };
 
             return builder.ConnectionString;
-        }
-
-        static List<string> GetPrimaryKeyColumns(SqlConnection conn, string tableName)
-        {
-            var primaryKeys = new List<string>();
-
-            string sql = @"
-                SELECT COLUMN_NAME
-                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
-                  AND TABLE_NAME = @TableName
-                ORDER BY ORDINAL_POSITION";
-
-            try
-            {
-                using (var cmd = new SqlCommand(sql, conn))
-                {
-                    cmd.Parameters.AddWithValue("@TableName", tableName);
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            string columnName = reader["COLUMN_NAME"]?.ToString() ?? "";
-                            if (!string.IsNullOrEmpty(columnName))
-                            {
-                                primaryKeys.Add(columnName);
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteWarning($"Could not retrieve primary key information: {ex.Message}");
-            }
-
-            return primaryKeys;
-        }
-
-        static void SearchTable(string environment, string database, string tableName, string searchValue, bool useRegexFromCmdLine = false)
-        {
-            // Parse search value for regex
-            bool useRegex = useRegexFromCmdLine || searchValue.StartsWith("REGEX:");
-            if (useRegex && searchValue.StartsWith("REGEX:"))
-            {
-                searchValue = searchValue.Substring(6); // Remove "REGEX:" prefix
-            }
-
-            try
-            {
-                string connectionString = GetFullConnectionString(environment, database);
-
-                using (var conn = new SqlConnection(connectionString))
-                {
-                    try
-                    {
-                        conn.Open();
-                        WriteSuccess($"Connected to {environments.GetValueOrDefault(environment, environment)} - {database}");
-                    }
-                    catch (Exception ex)
-                    {
-                        WriteError($"Failed to connect to database: {ex.Message}");
-                        WriteWarning("Connection failed. Please check your configuration.");
-                        return; // Don't exit, just return to allow recovery
-                    }
-
-                    // Check if table exists
-                    if (!TableExists(conn, tableName))
-                    {
-                        WriteError($"Table '{tableName}' does not exist in database '{database}'!");
-                        WriteWarning("Table not found. Please verify the table name.");
-                        return; // Don't exit, just return
-                    }
-
-                    // Get primary key columns
-                    var primaryKeys = GetPrimaryKeyColumns(conn, tableName);
-
-                    // Get string columns
-                    var columns = GetStringColumns(conn, tableName);
-
-                    if (columns.Count == 0)
-                    {
-                        WriteWarning($"No searchable string columns found in table '{tableName}'.");
-                        WriteInfo("This table may only contain non-string columns (numbers, dates, etc.)");
-                        return; // Don't exit, just return
-                    }
-
-                    WriteInfo($"Found {columns.Count} searchable columns. Searching...");
-                    if (primaryKeys.Count > 0)
-                    {
-                        WriteInfo($"Primary Key(s): {string.Join(", ", primaryKeys)}");
-                    }
-                    else
-                    {
-                        WriteWarning("No primary key found - results will show available unique identifiers");
-                    }
-
-                    if (useRegex)
-                    {
-                        WriteHighlight($"Using Regular Expression: {searchValue}");
-                    }
-                    Console.WriteLine();
-
-                    int totalMatches = 0;
-                    int columnsWithMatches = 0;
-                    var totalTime = Stopwatch.StartNew();
-                    var allMatchingRecords = new List<MatchingRecord>();
-
-                    // Search each column
-                    foreach (var column in columns)
-                    {
-                        var columnTime = Stopwatch.StartNew();
-
-                        int matchCount = 0;
-                        var columnMatches = new List<MatchingRecord>();
-
-                        try
-                        {
-                            if (useRegex)
-                            {
-                                columnMatches = SearchColumnRegexWithKeys(conn, tableName, column.Name, searchValue, primaryKeys);
-                            }
-                            else
-                            {
-                                columnMatches = SearchColumnWithKeys(conn, tableName, column.Name, searchValue, primaryKeys);
-                            }
-                            matchCount = columnMatches.Count;
-                        }
-                        catch (Exception ex)
-                        {
-                            WriteError($"Error searching column {column.Name}: {ex.Message}");
-                            continue; // Skip this column and continue with others
-                        }
-
-                        columnTime.Stop();
-
-                        if (matchCount > 0)
-                        {
-                            columnsWithMatches++;
-                            totalMatches += matchCount;
-                            allMatchingRecords.AddRange(columnMatches);
-
-                            WriteColoredInline("✓ Column: ", ConsoleColor.Green);
-                            WriteColoredInline(column.Name, ConsoleColor.White);
-                            Console.WriteLine();
-
-                            Console.WriteLine($"  Type: {column.DataType}({GetLengthDisplay(column.MaxLength)}) {(column.IsNullable ? "NULL" : "NOT NULL")}");
-
-                            WriteColoredInline("  Matches: ", ConsoleColor.Cyan);
-                            WriteColoredInline($"{matchCount:N0}", ConsoleColor.Yellow);
-                            Console.WriteLine();
-
-                            bool showTiming = bool.Parse(ConfigurationManager.AppSettings["ShowTimingDetails"] ?? "true");
-                            if (showTiming)
-                            {
-                                Console.WriteLine($"  Search Time: {columnTime.ElapsedMilliseconds} ms");
-                            }
-
-                            // Show sample matching records with primary keys
-                            WriteColoredInline("  Sample Matches:", ConsoleColor.Magenta);
-                            Console.WriteLine();
-
-                            int maxSamples = int.Parse(ConfigurationManager.AppSettings["DefaultMaxSamples"] ?? "3");
-                            var sampleMatches = columnMatches.Take(maxSamples).ToList();
-
-                            foreach (var match in sampleMatches)
-                            {
-                                WriteColoredInline("    • ", ConsoleColor.Gray);
-                                WriteColoredInline($"{column.Name}: ", ConsoleColor.Cyan);
-                                WriteColoredInline($"'{match.MatchingValue}'", ConsoleColor.Yellow);
-
-                                if (match.PrimaryKeyValues.Count > 0)
-                                {
-                                    WriteColoredInline(" | ", ConsoleColor.Gray);
-                                    WriteColoredInline("Keys: ", ConsoleColor.Magenta);
-                                    var keyPairs = match.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}");
-                                    Console.Write(string.Join(", ", keyPairs));
-                                }
-                                Console.WriteLine();
-                            }
-
-                            if (columnMatches.Count > maxSamples)
-                            {
-                                WriteColoredInline($"    ... and {columnMatches.Count - maxSamples} more matches", ConsoleColor.Gray);
-                                Console.WriteLine();
-                            }
-                            Console.WriteLine();
-                        }
-                    }
-
-                    totalTime.Stop();
-
-                    // Enhanced Summary with record details
-                    WriteInfo("============================================");
-                    WriteInfo("SEARCH SUMMARY:");
-                    WriteInfo("============================================");
-                    Console.WriteLine($"  Environment: {environments.GetValueOrDefault(environment, environment)}");
-                    Console.WriteLine($"  Database: {database}");
-                    Console.WriteLine($"  Table: {tableName}");
-                    Console.WriteLine($"  Search Value: {searchValue}");
-                    Console.WriteLine($"  Search Type: {(useRegex ? "Regular Expression" : "LIKE Pattern")}");
-
-                    WriteColoredInline("  Columns Searched: ", ConsoleColor.Cyan);
-                    Console.WriteLine(columns.Count.ToString());
-
-                    WriteColoredInline("  Columns with Matches: ", ConsoleColor.Green);
-                    Console.WriteLine(columnsWithMatches.ToString());
-
-                    WriteColoredInline("  Total Matches: ", ConsoleColor.Yellow);
-                    Console.WriteLine($"{totalMatches:N0}");
-
-                    Console.WriteLine($"  Total Search Time: {totalTime.ElapsedMilliseconds} ms");
-                    Console.WriteLine($"  Average Time per Column: {(columns.Count > 0 ? totalTime.ElapsedMilliseconds / columns.Count : 0)} ms");
-
-                    // Show detailed record summary if we have matches
-                    if (allMatchingRecords.Count > 0)
-                    {
-                        Console.WriteLine();
-                        WriteInfo("MATCHING RECORDS SUMMARY:");
-                        WriteInfo("----------------------------------------");
-
-                        // Group by unique primary key combinations to avoid duplicates
-                        var uniqueRecords = allMatchingRecords
-                            .GroupBy(r => string.Join("|", r.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}")))
-                            .Select(g => g.First())
-                            .Take(10) // Show max 10 unique records in summary
-                            .ToList();
-
-                        foreach (var record in uniqueRecords)
-                        {
-                            WriteColoredInline("  Record: ", ConsoleColor.Green);
-                            if (record.PrimaryKeyValues.Count > 0)
-                            {
-                                var keyPairs = record.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}");
-                                Console.WriteLine(string.Join(", ", keyPairs));
-                                WriteColoredInline("    Found in: ", ConsoleColor.Cyan);
-                                WriteColoredInline($"{record.ColumnName}", ConsoleColor.White);
-                                WriteColoredInline($" = '{record.MatchingValue}'", ConsoleColor.Yellow);
-                                Console.WriteLine();
-                            }
-                            else
-                            {
-                                WriteColoredInline($"{record.ColumnName}", ConsoleColor.White);
-                                WriteColoredInline($" = '{record.MatchingValue}'", ConsoleColor.Yellow);
-                                Console.WriteLine(" (No primary key available)");
-                            }
-                        }
-
-                        var totalUniqueRecords = allMatchingRecords
-                            .GroupBy(r => string.Join("|", r.PrimaryKeyValues.Select(kv => $"{kv.Key}={kv.Value}")))
-                            .Count();
-
-                        if (totalUniqueRecords > 10)
-                        {
-                            WriteColoredInline($"  ... and {totalUniqueRecords - 10} more unique records", ConsoleColor.Gray);
-                            Console.WriteLine();
-                        }
-
-                        Console.WriteLine();
-                        WriteColoredInline("  Unique Records Found: ", ConsoleColor.Magenta);
-                        Console.WriteLine(totalUniqueRecords.ToString());
-                    }
-
-                    WriteInfo("============================================");
-
-                    if (columnsWithMatches == 0)
-                    {
-                        Console.WriteLine();
-                        WriteWarning("No matches found in any column.");
-                        WriteHighlight("Tips:");
-                        Console.WriteLine("- Try using wildcards: %search_term%");
-                        Console.WriteLine("- Check your search term spelling");
-                        Console.WriteLine("- Verify the table contains the expected data");
-                        if (!useRegex)
-                        {
-                            Console.WriteLine("- Consider using regular expressions for more complex patterns");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteError($"Unexpected error during search: {ex.Message}");
-                if (ex.InnerException != null)
-                {
-                    WriteError($"Details: {ex.InnerException.Message}");
-                }
-                WriteWarning("Search failed, but you can try again with different parameters.");
-            }
-        }
-
-        static List<MatchingRecord> SearchColumnWithKeys(SqlConnection conn, string tableName, string columnName, string searchValue, List<string> primaryKeys)
-        {
-            var matches = new List<MatchingRecord>();
-
-            // Build SELECT statement with primary keys
-            var selectColumns = new List<string> { $"[{columnName}]" };
-            selectColumns.AddRange(primaryKeys.Select(pk => $"[{pk}]"));
-
-            string sql = $"SELECT {string.Join(", ", selectColumns.Distinct())} FROM [{tableName}] WHERE [{columnName}] LIKE @SearchValue";
-
-            using (var cmd = new SqlCommand(sql, conn))
-            {
-                cmd.Parameters.AddWithValue("@SearchValue", searchValue);
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var match = new MatchingRecord
-                        {
-                            ColumnName = columnName,
-                            MatchingValue = reader[columnName]?.ToString() ?? "<NULL>"
-                        };
-
-                        // Get primary key values
-                        foreach (string pkColumn in primaryKeys)
-                        {
-                            var pkValue = reader[pkColumn];
-                            match.PrimaryKeyValues[pkColumn] = pkValue?.ToString() ?? "<NULL>";
-                        }
-
-                        matches.Add(match);
-                    }
-                }
-            }
-
-            return matches;
-        }
-
-        static List<MatchingRecord> SearchColumnRegexWithKeys(SqlConnection conn, string tableName, string columnName, string regexPattern, List<string> primaryKeys)
-        {
-            var matches = new List<MatchingRecord>();
-
-            try
-            {
-                var regex = new Regex(regexPattern, RegexOptions.IgnoreCase);
-
-                // Build SELECT statement with primary keys
-                var selectColumns = new List<string> { $"[{columnName}]" };
-                selectColumns.AddRange(primaryKeys.Select(pk => $"[{pk}]"));
-
-                string sql = $"SELECT {string.Join(", ", selectColumns.Distinct())} FROM [{tableName}] WHERE [{columnName}] IS NOT NULL";
-
-                using (var cmd = new SqlCommand(sql, conn))
-                {
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            var value = reader[columnName];
-                            if (value != null && value != DBNull.Value)
-                            {
-                                string stringValue = value.ToString() ?? "";
-                                if (regex.IsMatch(stringValue))
-                                {
-                                    var match = new MatchingRecord
-                                    {
-                                        ColumnName = columnName,
-                                        MatchingValue = stringValue
-                                    };
-
-                                    // Get primary key values
-                                    foreach (string pkColumn in primaryKeys)
-                                    {
-                                        var pkValue = reader[pkColumn];
-                                        match.PrimaryKeyValues[pkColumn] = pkValue?.ToString() ?? "<NULL>";
-                                    }
-
-                                    matches.Add(match);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteError($"Error in regex search with keys: {ex.Message}");
-            }
-
-            return matches;
-        }
-
-        static void ShowUsage()
-        {
-            WriteInfo("Database Value Searcher - Usage:");
-            Console.WriteLine("");
-            WriteHighlight("Interactive Mode (Recommended):");
-            Console.WriteLine("  DatabaseValueSearcher.exe");
-            Console.WriteLine("  - Guides you through environment, database, and table selection");
-            Console.WriteLine("  - Shows available tables and views with row counts");
-            Console.WriteLine("  - Provides search pattern examples and tips");
-            Console.WriteLine("  - Supports navigation (back/quit commands)");
-            Console.WriteLine("  - Shows primary keys with matching records");
-            Console.WriteLine("");
-            WriteHighlight("Command Line Mode:");
-            Console.WriteLine("  DatabaseValueSearcher.exe <environment> <database> <table_name> <search_value> [--regex]");
-            Console.WriteLine("");
-            WriteInfo("Available Environments:");
-            foreach (var env in environments)
-            {
-                Console.WriteLine($"  {env.Key} - {env.Value}");
-            }
-            Console.WriteLine("");
-            WriteHighlight("Search Pattern Examples:");
-            WriteInfo("LIKE Patterns:");
-            Console.WriteLine("  %john%        - Contains 'john' anywhere");
-            Console.WriteLine("  john%         - Starts with 'john'");
-            Console.WriteLine("  %john         - Ends with 'john'");
-            Console.WriteLine("  john          - Exact match");
-            Console.WriteLine("  j_hn          - 'j' + any single character + 'hn'");
-            Console.WriteLine("");
-            WriteInfo("Regular Expression Patterns:");
-            Console.WriteLine("  ^john$        - Exact match for 'john'");
-            Console.WriteLine("  john.*        - Starts with 'john'");
-            Console.WriteLine("  .*john.*      - Contains 'john' anywhere");
-            Console.WriteLine("  \\d{3}-\\d{3}-\\d{4} - Phone number pattern");
-            Console.WriteLine("  [a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,} - Email pattern");
-            Console.WriteLine("");
-            WriteHighlight("Examples:");
-            Console.WriteLine("  DatabaseValueSearcher.exe");
-            Console.WriteLine("  DatabaseValueSearcher.exe Local MyDatabase Users \"%john%\"");
-            Console.WriteLine("  DatabaseValueSearcher.exe QA OrdersDB OrderView \"\\d{5}\" --regex");
-        }
-
-        static string GetLengthDisplay(int maxLength)
-        {
-            if (maxLength == -1) return "MAX";
-            if (maxLength == 0) return "?";
-            return maxLength.ToString();
-        }
-
-        static bool TableExists(SqlConnection conn, string tableName)
-        {
-            string sql = @"
-                SELECT COUNT(*) 
-                FROM INFORMATION_SCHEMA.TABLES 
-                WHERE TABLE_NAME = @TableName 
-                  AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')";
-            using (var cmd = new SqlCommand(sql, conn))
-            {
-                cmd.Parameters.AddWithValue("@TableName", tableName);
-                int count = Convert.ToInt32(cmd.ExecuteScalar());
-                return count > 0;
-            }
-        }
-
-        static List<ColumnInfo> GetStringColumns(SqlConnection conn, string tableName)
-        {
-            var columns = new List<ColumnInfo>();
-
-            string sql = @"
-                SELECT COLUMN_NAME, DATA_TYPE, 
-                       ISNULL(CHARACTER_MAXIMUM_LENGTH, 0) as MaxLength,
-                       IS_NULLABLE
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_NAME = @TableName
-                  AND DATA_TYPE IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
-                ORDER BY ORDINAL_POSITION";
-
-            using (var cmd = new SqlCommand(sql, conn))
-            {
-                cmd.Parameters.AddWithValue("@TableName", tableName);
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        var column = new ColumnInfo
-                        {
-                            Name = reader["COLUMN_NAME"]?.ToString() ?? string.Empty,
-                            DataType = reader["DATA_TYPE"]?.ToString() ?? string.Empty,
-                            MaxLength = Convert.ToInt32(reader["MaxLength"] ?? 0),
-                            IsNullable = (reader["IS_NULLABLE"]?.ToString() ?? "NO") == "YES"
-                        };
-                        columns.Add(column);
-                    }
-                }
-            }
-
-            return columns;
         }
     }
 }
