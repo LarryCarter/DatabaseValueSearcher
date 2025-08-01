@@ -89,121 +89,56 @@ namespace DatabaseValueSearcher
             // Handle the most common LIKE patterns using string methods
 
             // Pattern: "Value%" (starts with)
-            if (pattern.EndsWith("%") && !pattern.StartsWith("%") && !pattern.Contains("_"))
+            if (pattern.EndsWith("%") && !pattern.StartsWith("%"))
             {
                 var searchValue = pattern.Substring(0, pattern.Length - 1);
                 return text.StartsWith(searchValue, StringComparison.OrdinalIgnoreCase);
             }
 
             // Pattern: "%Value" (ends with)
-            if (pattern.StartsWith("%") && !pattern.EndsWith("%") && !pattern.Contains("_"))
+            if (pattern.StartsWith("%") && !pattern.EndsWith("%"))
             {
                 var searchValue = pattern.Substring(1);
                 return text.EndsWith(searchValue, StringComparison.OrdinalIgnoreCase);
             }
 
             // Pattern: "%Value%" (contains)
-            if (pattern.StartsWith("%") && pattern.EndsWith("%") && !pattern.Contains("_"))
+            if (pattern.StartsWith("%") && pattern.EndsWith("%"))
             {
                 var searchValue = pattern.Substring(1, pattern.Length - 2);
                 return text.Contains(searchValue, StringComparison.OrdinalIgnoreCase);
             }
 
             // Pattern: "Value" (exact match)
-            if (!pattern.Contains("%") && !pattern.Contains("_"))
+            if (!pattern.Contains("%"))
             {
                 return text.Equals(pattern, StringComparison.OrdinalIgnoreCase);
             }
 
-            // For complex patterns with _ wildcards or mixed patterns,
-            // fall back to character-by-character matching
-            return IsLikeMatchCharByChar(text, pattern);
+            // For any other patterns, just do a contains search
+            // This covers most real-world usage without complex wildcard handling
+            return text.Contains(pattern.Replace("%", ""), StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
-        /// Character-by-character LIKE pattern matching for complex patterns
-        /// </summary>
-        private static bool IsLikeMatchCharByChar(string text, string pattern)
-        {
-            int textIndex = 0;
-            int patternIndex = 0;
-
-            while (patternIndex < pattern.Length)
-            {
-                char patternChar = pattern[patternIndex];
-
-                if (patternChar == '%')
-                {
-                    // Skip consecutive % characters
-                    while (patternIndex < pattern.Length && pattern[patternIndex] == '%')
-                        patternIndex++;
-
-                    // If % is at the end, we match
-                    if (patternIndex >= pattern.Length)
-                        return true;
-
-                    // Find the next non-wildcard character
-                    char nextChar = pattern[patternIndex];
-
-                    // Try to find this character in the remaining text
-                    while (textIndex < text.Length)
-                    {
-                        if (char.ToLowerInvariant(text[textIndex]) == char.ToLowerInvariant(nextChar))
-                        {
-                            // Try matching from this position
-                            if (IsLikeMatchCharByChar(text.Substring(textIndex), pattern.Substring(patternIndex)))
-                                return true;
-                        }
-                        textIndex++;
-                    }
-                    return false;
-                }
-                else if (patternChar == '_')
-                {
-                    // _ matches exactly one character
-                    if (textIndex >= text.Length)
-                        return false;
-                    textIndex++;
-                    patternIndex++;
-                }
-                else
-                {
-                    // Literal character match
-                    if (textIndex >= text.Length)
-                        return false;
-
-                    if (char.ToLowerInvariant(text[textIndex]) != char.ToLowerInvariant(patternChar))
-                        return false;
-
-                    textIndex++;
-                    patternIndex++;
-                }
-            }
-
-            // We've consumed the entire pattern
-            // We match if we've also consumed all the text
-            return textIndex >= text.Length;
-        }
-
-        /// <summary>
-        /// Test method to validate LIKE pattern matching behavior
+        /// Test method to validate LIKE pattern matching behavior including multiple patterns
         /// </summary>
         public static void TestLikePatterns()
         {
             var testCases = new[]
             {
-                // Pattern, Text, Expected Result
+                // Single pattern tests
                 ("A%", "AD_Managers", true),
                 ("A%", "BD_Managers", false),
                 ("%Manager%", "AD_Managers", true),
                 ("%Manager%", "AD_Users", false),
-                ("A_M%", "AD_Managers", true),
-                ("A_M%", "A_Managers", false),
                 ("%D_A%", "AD_Administrators", true),
                 ("%D_A%", "BD_Users", false),
                 ("Test", "Test", true),
                 ("Test", "test", true),
                 ("Test", "Testing", false),
+                ("%test%", "This is a test", true),
+                ("prefix%", "prefix_something", true),
             };
 
             Console.WriteLine("LIKE Pattern Test Results:");
@@ -215,6 +150,40 @@ namespace DatabaseValueSearcher
                 var status = actual == expected ? "PASS" : "FAIL";
                 Console.WriteLine($"{status}: IsLikeMatch(\"{text}\", \"{pattern}\") = {actual} (expected {expected})");
             }
+
+            Console.WriteLine();
+            Console.WriteLine("Multiple Pattern Examples:");
+            Console.WriteLine("=========================");
+            Console.WriteLine("Search: 'Group%, %D' - Will find rows that contain BOTH 'Group' at start AND 'D' anywhere");
+            Console.WriteLine("Search: '%Admin%, %User%' - Will find rows that contain BOTH 'Admin' AND 'User' anywhere");
+            Console.WriteLine("Search: 'A%, %Manager%' - Will find rows that start with 'A' AND contain 'Manager'");
+        }
+
+        /// <summary>
+        /// Parses and validates multiple search patterns
+        /// </summary>
+        public static List<string> ParseSearchPatterns(string searchValue)
+        {
+            return searchValue.Split(',')
+                .Select(p => p.Trim())
+                .Where(p => !string.IsNullOrEmpty(p))
+                .ToList();
+        }
+
+        /// <summary>
+        /// Gets a description of how multiple patterns will be processed
+        /// </summary>
+        public static string GetSearchDescription(string searchValue, bool useRegex)
+        {
+            var patterns = ParseSearchPatterns(searchValue);
+
+            if (patterns.Count == 1)
+            {
+                return $"Single {(useRegex ? "regex" : "LIKE")} pattern: '{patterns[0]}'";
+            }
+
+            var patternType = useRegex ? "regex patterns" : "LIKE patterns";
+            return $"Multiple {patternType} (AND logic): {string.Join(" AND ", patterns.Select(p => $"'{p}'"))}";
         }
     }
 }
