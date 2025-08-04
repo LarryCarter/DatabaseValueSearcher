@@ -15,7 +15,7 @@ namespace DatabaseValueSearcher
         private static CacheManager cacheManager = new CacheManager();
         private static PerformanceManager performanceManager = new PerformanceManager();
         private static SearchSession? currentSession;
-
+        
         // In-memory caches for database and table lists
         private static Dictionary<string, List<string>> databaseListCache = new Dictionary<string, List<string>>();
         private static Dictionary<string, List<TableViewInfo>> tableListCache = new Dictionary<string, List<TableViewInfo>>();
@@ -65,12 +65,15 @@ namespace DatabaseValueSearcher
         }
 
         /// <summary>
-        /// Loads environment configuration from App.config
+        /// Loads environment configuration from App.config (Updated for Simple Config)
         /// </summary>
         static void LoadEnvironments()
         {
             try
             {
+                logger.LogDebug("Loading environment configuration");
+
+                // Try to load from custom databaseEnvironments section first
                 var envSection = ConfigurationManager.GetSection("databaseEnvironments") as System.Collections.Specialized.NameValueCollection;
                 if (envSection != null)
                 {
@@ -79,29 +82,58 @@ namespace DatabaseValueSearcher
                         if (key != null)
                         {
                             environments[key] = envSection[key] ?? key;
+                            logger.LogDebug($"Loaded environment from custom section: {key} -> {environments[key]}");
                         }
                     }
                 }
 
-                // Fallback to connection strings if no environment section
+                // If no custom section, try to load from appSettings with Environment_ prefix
                 if (environments.Count == 0)
                 {
+                    logger.LogDebug("No custom databaseEnvironments section found, checking appSettings for Environment_ keys");
+
+                    foreach (string key in ConfigurationManager.AppSettings.AllKeys)
+                    {
+                        if (key.StartsWith("Environment_"))
+                        {
+                            var envKey = key.Substring("Environment_".Length);
+                            var envValue = ConfigurationManager.AppSettings[key];
+                            if (!string.IsNullOrEmpty(envValue))
+                            {
+                                environments[envKey] = envValue;
+                                logger.LogDebug($"Loaded environment from appSettings: {envKey} -> {envValue}");
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to connection strings if no environment configuration found
+                if (environments.Count == 0)
+                {
+                    logger.LogWarning("No environment configuration found, falling back to connection strings");
                     foreach (ConnectionStringSettings connStr in ConfigurationManager.ConnectionStrings)
                     {
                         if (connStr.Name != "LocalSqlServer") // Skip default .NET connection
                         {
                             environments[connStr.Name] = connStr.Name;
+                            logger.LogDebug($"Loaded connection string environment: {connStr.Name}");
                         }
                     }
                 }
 
                 if (environments.Count == 0)
                 {
+                    logger.LogError("No environments configured in App.config");
                     DisplayMessages.WriteWarning("No environments configured. Please check your App.config file.");
+                }
+                else
+                {
+                    logger.LogInfo($"Successfully loaded {environments.Count} environments");
                 }
             }
             catch (Exception ex)
             {
+                logger.LogError("Failed to load environments from configuration", ex);
                 DisplayMessages.WriteError($"Error loading environments: {ex.Message}");
             }
         }
@@ -379,7 +411,7 @@ namespace DatabaseValueSearcher
             Console.WriteLine($"Database: {stats.Database}");
             Console.WriteLine($"Table: {stats.TableName}");
             Console.WriteLine($"Created: {stats.CreatedAt:yyyy-MM-dd HH:mm:ss} ({stats.Age.TotalMinutes:F0} minutes ago)");
-
+            
             if (stats.IsInitialized)
             {
                 Console.WriteLine($"Cached: {stats.CachedAt:yyyy-MM-dd HH:mm:ss} ({stats.CacheAge.TotalMinutes:F0} minutes ago)");
@@ -389,7 +421,7 @@ namespace DatabaseValueSearcher
                 Console.WriteLine($"Page Size: {stats.PageSize:N0} rows");
                 Console.WriteLine($"Cache Status: {stats.CachedPages}/{stats.TotalPages} pages ({stats.CompletionPercentage:F1}%)");
                 Console.WriteLine($"Cache Size: {stats.CacheSizeDisplay}");
-
+                
                 if (stats.IsComplete)
                 {
                     DisplayMessages.WriteColoredInline("Completeness: ", ConsoleColor.White);

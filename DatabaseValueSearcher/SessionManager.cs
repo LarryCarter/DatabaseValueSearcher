@@ -112,6 +112,9 @@ namespace DatabaseValueSearcher
         /// <summary>
         /// Fetches a specific page from the database and caches it
         /// </summary>
+        /// <summary>
+        /// Fetches a specific page from the database and caches it
+        /// </summary>
         public async Task<DataPage?> FetchPageFromDatabase(SearchSession session, int pageNumber)
         {
             if (session.CachedData == null) return null;
@@ -129,12 +132,33 @@ namespace DatabaseValueSearcher
                 var allColumns = new List<string>(session.CachedData.Columns.Select(c => c.Name));
                 allColumns.AddRange(session.CachedData.PrimaryKeys.Where(pk => !allColumns.Contains(pk)));
 
-                var sql = $@"
-                    SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))}
+                string sql;
+
+                // Check if we have primary keys for proper ordering
+                if (session.CachedData.PrimaryKeys.Any())
+                {
+                    // Use OFFSET/FETCH with primary key ordering (SQL Server 2012+)
+                    var orderByColumns = string.Join(", ", session.CachedData.PrimaryKeys.Select(pk => $"[{pk}]"));
+                    sql = $@"
+                SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))}
+                FROM [{session.TableName}]
+                ORDER BY {orderByColumns}
+                OFFSET {offset} ROWS
+                FETCH NEXT {session.CachedData.PageSize} ROWS ONLY";
+                }
+                else
+                {
+                    // Fallback for tables without primary keys - use ROW_NUMBER() window function
+                    sql = $@"
+                WITH PagedData AS (
+                    SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))},
+                           ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as RowNum
                     FROM [{session.TableName}]
-                    ORDER BY {string.Join(", ", session.CachedData.PrimaryKeys.Select(pk => $"[{pk}]"))}
-                    OFFSET {offset} ROWS
-                    FETCH NEXT {session.CachedData.PageSize} ROWS ONLY";
+                )
+                SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))}
+                FROM PagedData
+                WHERE RowNum > {offset} AND RowNum <= {offset + session.CachedData.PageSize}";
+                }
 
                 using var cmd = new SqlCommand(sql, conn);
                 performanceManager.ConfigureCommand(cmd);
@@ -145,25 +169,46 @@ namespace DatabaseValueSearcher
                     Rows = new List<Dictionary<string, object?>>()
                 };
 
-                using var reader = await cmd.ExecuteReaderAsync();
-                while (await reader.ReadAsync())
+                try
                 {
-                    var row = new Dictionary<string, object?>();
-                    for (int i = 0; i < reader.FieldCount; i++)
+                    using var reader = await cmd.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
                     {
-                        var columnName = reader.GetName(i);
-                        var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                        row[columnName] = value;
+                        var row = new Dictionary<string, object?>();
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            var columnName = reader.GetName(i);
+                            // Skip the RowNum column if it exists (from fallback query)
+                            if (columnName == "RowNum") continue;
+
+                            var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                            row[columnName] = value;
+                        }
+                        page.Rows.Add(row);
                     }
-                    page.Rows.Add(row);
+
+                    page.IsLastPage = page.Rows.Count < session.CachedData.PageSize;
+
+                    // Cache the page
+                    cacheManager.SavePage(cacheKey, pageNumber, page);
+
+                    return page;
                 }
+                catch (SqlException ex)
+                {
+                    DisplayMessages.WriteError($"SQL Error on page {pageNumber}: {ex.Message}");
 
-                page.IsLastPage = page.Rows.Count < session.CachedData.PageSize;
+                    // Log the SQL that failed for debugging
+                    DisplayMessages.WriteWarning($"Failed SQL: {sql}");
 
-                // Cache the page
-                cacheManager.SavePage(cacheKey, pageNumber, page);
-
-                return page;
+                    // Return empty page rather than crashing
+                    return new DataPage
+                    {
+                        PageNumber = pageNumber,
+                        Rows = new List<Dictionary<string, object?>>(),
+                        IsLastPage = true
+                    };
+                }
             });
         }
 
