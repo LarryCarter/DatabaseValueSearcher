@@ -14,8 +14,9 @@ namespace DatabaseValueSearcher
         private static Dictionary<string, string> environments = new Dictionary<string, string>();
         private static CacheManager cacheManager = new CacheManager();
         private static PerformanceManager performanceManager = new PerformanceManager();
+        private static LoggingService logger = new LoggingService(); // Add the missing logger
         private static SearchSession? currentSession;
-        
+
         // In-memory caches for database and table lists
         private static Dictionary<string, List<string>> databaseListCache = new Dictionary<string, List<string>>();
         private static Dictionary<string, List<TableViewInfo>> tableListCache = new Dictionary<string, List<TableViewInfo>>();
@@ -38,6 +39,9 @@ namespace DatabaseValueSearcher
                     Console.OutputEncoding = System.Text.Encoding.UTF8;
                 }
 
+                // Initialize logging
+                logger.LogInfo("Database Value Searcher starting up");
+
                 // Initialize core components
                 LoadEnvironments();
                 InitializeServices();
@@ -53,6 +57,7 @@ namespace DatabaseValueSearcher
             }
             catch (Exception ex)
             {
+                logger.LogCritical("Fatal error during application startup", ex);
                 DisplayMessages.WriteError($"FATAL ERROR: {ex.Message}");
                 if (ex.InnerException != null)
                 {
@@ -143,11 +148,23 @@ namespace DatabaseValueSearcher
         /// </summary>
         static void InitializeServices()
         {
-            databaseService = new DatabaseService(performanceManager);
-            navigationService = new NavigationService(databaseService, environments, databaseListCache, tableListCache, cacheTimestamps);
-            cacheUI = new CacheUI(cacheManager, databaseListCache, tableListCache, cacheTimestamps);
-            exportService = new ExportService(cacheManager);
-            sessionManager = new SessionManager(cacheManager, performanceManager, databaseService);
+            try
+            {
+                logger.LogInfo("Initializing services");
+
+                databaseService = new DatabaseService(performanceManager);
+                navigationService = new NavigationService(databaseService, environments, databaseListCache, tableListCache, cacheTimestamps);
+                cacheUI = new CacheUI(cacheManager, databaseListCache, tableListCache, cacheTimestamps);
+                exportService = new ExportService(cacheManager);
+                sessionManager = new SessionManager(cacheManager, performanceManager, databaseService);
+
+                logger.LogInfo("All services initialized successfully");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Failed to initialize services", ex);
+                throw;
+            }
         }
 
         /// <summary>
@@ -155,6 +172,8 @@ namespace DatabaseValueSearcher
         /// </summary>
         static async Task RunInteractiveMode()
         {
+            logger.LogInfo("Starting interactive mode");
+
             DisplayMessages.WriteInfo("============================================");
             DisplayMessages.WriteInfo("DATABASE VALUE SEARCHER - INTERACTIVE MODE");
             DisplayMessages.WriteInfo("============================================");
@@ -181,7 +200,11 @@ namespace DatabaseValueSearcher
                 while (string.IsNullOrEmpty(environment))
                 {
                     environment = navigationService!.SelectEnvironment();
-                    if (environment == "quit") return;
+                    if (environment == "quit")
+                    {
+                        logger.LogInfo("User quit from environment selection");
+                        return;
+                    }
                     if (environment == "cache")
                     {
                         await cacheUI!.HandleCacheCommands(currentSession);
@@ -190,11 +213,17 @@ namespace DatabaseValueSearcher
                     }
                 }
 
+                logger.LogUserAction($"Selected environment: {environment}");
+
                 // Step 2: Select Database
                 while (string.IsNullOrEmpty(database))
                 {
                     database = await navigationService!.SelectDatabase(environment);
-                    if (database == "quit") return;
+                    if (database == "quit")
+                    {
+                        logger.LogInfo("User quit from database selection");
+                        return;
+                    }
                     if (database == "back")
                     {
                         environment = "";
@@ -208,11 +237,17 @@ namespace DatabaseValueSearcher
                 }
                 if (string.IsNullOrEmpty(environment)) continue;
 
+                logger.LogUserAction($"Selected database: {database}");
+
                 // Step 3: Select Table or View
                 while (string.IsNullOrEmpty(tableOrView))
                 {
                     tableOrView = await navigationService!.SelectTableOrView(environment, database);
-                    if (tableOrView == "quit") return;
+                    if (tableOrView == "quit")
+                    {
+                        logger.LogInfo("User quit from table selection");
+                        return;
+                    }
                     if (tableOrView == "back")
                     {
                         database = "";
@@ -226,6 +261,8 @@ namespace DatabaseValueSearcher
                 }
                 if (string.IsNullOrEmpty(database)) continue;
 
+                logger.LogUserAction($"Selected table: {tableOrView}");
+
                 // Create new session
                 currentSession = new SearchSession
                 {
@@ -233,6 +270,8 @@ namespace DatabaseValueSearcher
                     Database = database,
                     TableName = tableOrView
                 };
+
+                logger.LogInfo($"Created new session: {currentSession.SessionId} for {environment}.{database}.{tableOrView}");
 
                 // Step 4: Initialize cache for this table
                 await sessionManager!.InitializeTableCache(currentSession);
@@ -247,6 +286,8 @@ namespace DatabaseValueSearcher
         /// </summary>
         static async Task RunCommandLineMode(string[] args)
         {
+            logger.LogInfo($"Starting command line mode with args: {string.Join(" ", args)}");
+
             if (args.Length < 4)
             {
                 DisplayMessages.ShowUsageDisplay();
@@ -258,6 +299,8 @@ namespace DatabaseValueSearcher
             string tableName = args[2];
             string searchValue = args[3];
             bool useRegex = args.Length > 4 && args[4].Equals("--regex", StringComparison.OrdinalIgnoreCase);
+
+            logger.LogUserAction($"Command line search: {environment}.{database}.{tableName} for '{searchValue}' (regex: {useRegex})");
 
             DisplayMessages.WriteInfo("============================================");
             DisplayMessages.WriteInfo("DATABASE VALUE SEARCHER - COMMAND LINE MODE");
@@ -304,6 +347,8 @@ namespace DatabaseValueSearcher
             Console.Write("Choose action: ");
             string action = Console.ReadLine()?.Trim() ?? "";
 
+            logger.LogUserAction($"Session action: {action}");
+
             switch (action.ToLower())
             {
                 case "search":
@@ -319,6 +364,7 @@ namespace DatabaseValueSearcher
                     await SelectNewDatabase();
                     break;
                 case "clear":
+                    logger.LogUserAction("Clearing current session");
                     currentSession = null;
                     break;
                 case "export":
@@ -331,6 +377,7 @@ namespace DatabaseValueSearcher
                     ShowSessionStatistics();
                     break;
                 case "quit":
+                    logger.LogInfo("User quit from active session");
                     Environment.Exit(0);
                     break;
                 default:
@@ -349,10 +396,13 @@ namespace DatabaseValueSearcher
             string tableOrView = await navigationService!.SelectTableOrView(currentSession.Environment, currentSession.Database);
             if (tableOrView == "quit")
             {
+                logger.LogInfo("User quit from new table selection");
                 Environment.Exit(0);
             }
             else if (tableOrView != "back" && tableOrView != "cache")
             {
+                logger.LogUserAction($"Changed table to: {tableOrView}");
+
                 // Update session with new table
                 currentSession.TableName = tableOrView;
                 currentSession.CachedData = null; // Clear old cache data
@@ -374,10 +424,13 @@ namespace DatabaseValueSearcher
             string database = await navigationService!.SelectDatabase(currentSession.Environment);
             if (database == "quit")
             {
+                logger.LogInfo("User quit from new database selection");
                 Environment.Exit(0);
             }
             else if (database != "back" && database != "cache")
             {
+                logger.LogUserAction($"Changed database to: {database}");
+
                 // Update session with new database
                 currentSession.Database = database;
                 currentSession.TableName = "";
@@ -411,7 +464,7 @@ namespace DatabaseValueSearcher
             Console.WriteLine($"Database: {stats.Database}");
             Console.WriteLine($"Table: {stats.TableName}");
             Console.WriteLine($"Created: {stats.CreatedAt:yyyy-MM-dd HH:mm:ss} ({stats.Age.TotalMinutes:F0} minutes ago)");
-            
+
             if (stats.IsInitialized)
             {
                 Console.WriteLine($"Cached: {stats.CachedAt:yyyy-MM-dd HH:mm:ss} ({stats.CacheAge.TotalMinutes:F0} minutes ago)");
@@ -421,7 +474,7 @@ namespace DatabaseValueSearcher
                 Console.WriteLine($"Page Size: {stats.PageSize:N0} rows");
                 Console.WriteLine($"Cache Status: {stats.CachedPages}/{stats.TotalPages} pages ({stats.CompletionPercentage:F1}%)");
                 Console.WriteLine($"Cache Size: {stats.CacheSizeDisplay}");
-                
+
                 if (stats.IsComplete)
                 {
                     DisplayMessages.WriteColoredInline("Completeness: ", ConsoleColor.White);
