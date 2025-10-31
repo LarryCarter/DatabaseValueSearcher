@@ -27,6 +27,7 @@ namespace DatabaseValueSearcher
         private static NavigationService? navigationService;
         private static CacheUI? cacheUI;
         private static ExportService? exportService;
+        private static ImportService? importService;
         private static SessionManager? sessionManager;
 
         static async Task Main(string[] args)
@@ -156,6 +157,7 @@ namespace DatabaseValueSearcher
                 navigationService = new NavigationService(databaseService, environments, databaseListCache, tableListCache, cacheTimestamps);
                 cacheUI = new CacheUI(cacheManager, databaseListCache, tableListCache, cacheTimestamps);
                 exportService = new ExportService(cacheManager);
+                importService = new ImportService(performanceManager);
                 sessionManager = new SessionManager(cacheManager, performanceManager, databaseService);
 
                 logger.LogInfo("All services initialized successfully");
@@ -178,7 +180,7 @@ namespace DatabaseValueSearcher
             DisplayMessages.WriteInfo("DATABASE VALUE SEARCHER - INTERACTIVE MODE");
             DisplayMessages.WriteInfo("============================================");
             Console.WriteLine();
-            DisplayMessages.WriteHighlight("Navigation: Type 'back' to go back, 'quit' to exit, 'cache' for cache options, 'export' to export cache data");
+            DisplayMessages.WriteHighlight("Navigation: Type 'back' to go back, 'quit' to exit, 'cache' for cache options, 'export' to export, 'import' to import SQL files");
             cacheUI!.ShowCacheStatus();
             Console.WriteLine();
 
@@ -211,6 +213,12 @@ namespace DatabaseValueSearcher
                         environment = "";
                         continue;
                     }
+                    if (environment == "import")
+                    {
+                        await importService!.ImportMenu();
+                        environment = "";
+                        continue;
+                    }
                 }
 
                 logger.LogUserAction($"Selected environment: {environment}");
@@ -232,6 +240,11 @@ namespace DatabaseValueSearcher
                     if (database == "cache")
                     {
                         await cacheUI!.HandleCacheCommands(currentSession);
+                        continue;
+                    }
+                    if (database == "import")
+                    {
+                        await importService!.ImportMenu(environment);
                         continue;
                     }
                 }
@@ -256,6 +269,11 @@ namespace DatabaseValueSearcher
                     if (tableOrView == "cache")
                     {
                         await cacheUI!.HandleCacheCommands(currentSession);
+                        continue;
+                    }
+                    if (tableOrView == "import")
+                    {
+                        await importService!.ImportMenu(environment, database);
                         continue;
                     }
                 }
@@ -339,6 +357,7 @@ namespace DatabaseValueSearcher
             Console.WriteLine("  'database' - Select different database");
             Console.WriteLine("  'clear' - Start completely over");
             Console.WriteLine("  'export' - Export current table cache to SQL");
+            Console.WriteLine("  'import' - Import SQL file into database");
             Console.WriteLine("  'cache' - Cache management");
             Console.WriteLine("  'stats' - Show session statistics");
             Console.WriteLine("  'quit' - Exit application");
@@ -369,6 +388,9 @@ namespace DatabaseValueSearcher
                     break;
                 case "export":
                     await exportService!.ExportCachedTableMenu(currentSession, (session, pageNum) => sessionManager!.LoadOrFetchPage(session, pageNum));
+                    break;
+                case "import":
+                    await importService!.ImportMenu(currentSession?.Environment, currentSession?.Database);
                     break;
                 case "cache":
                     await cacheUI!.HandleCacheCommands(currentSession);

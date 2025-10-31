@@ -162,6 +162,125 @@ namespace DatabaseValueSearcher
             }
         }
 
+        // (Duplicate method removed)
+
+        /// <summary>
+        /// Handles table selection for pre-caching with options for cache mode
+        /// </summary>
+        public async Task<string> SelectTableForPreCache(List<TableViewInfo> tablesAndViews, string environment, string database)
+        {
+            Console.WriteLine();
+            DisplayMessages.WriteInfo("PRE-CACHE TABLE DATA");
+            DisplayMessages.WriteInfo("Select table to pre-cache (download data in advance):");
+
+            for (int i = 0; i < tablesAndViews.Count; i++)
+            {
+                var table = tablesAndViews[i];
+                string rowInfo = table.Type == "T" ? $" ({table.RowCount:N0} rows)" : "";
+                Console.Write($"  {i + 1}. ");
+                DisplayMessages.WriteColoredInline($"[{table.Type}]", table.Type == "T" ? ConsoleColor.Green : ConsoleColor.Blue);
+                Console.WriteLine($" {table.Name}{rowInfo}");
+            }
+
+            while (true)
+            {
+                Console.WriteLine();
+                Console.Write($"Select table to pre-cache (1-{tablesAndViews.Count}) [back/quit]: ");
+                string input = Console.ReadLine()?.Trim() ?? "";
+
+                if (input.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
+                if (input.Equals("back", StringComparison.OrdinalIgnoreCase)) return "back";
+
+                if (int.TryParse(input, out int selection) && selection >= 1 && selection <= tablesAndViews.Count)
+                {
+                    var selectedTable = tablesAndViews[selection - 1];
+
+                    // Show pre-cache options
+                    string cacheMode = await GetPreCacheMode(selectedTable);
+                    if (cacheMode == "quit") return "quit";
+                    if (cacheMode == "back") continue;
+
+                    if (!string.IsNullOrEmpty(cacheMode))
+                    {
+                        // Signal to start pre-caching
+                        return $"PRECACHE:{cacheMode}:{selectedTable.Name}";
+                    }
+                }
+                else
+                {
+                    DisplayMessages.WriteError("Invalid selection. Please try again.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets the pre-cache mode from user (full or partial)
+        /// </summary>
+        public async Task<string> GetPreCacheMode(TableViewInfo table)
+        {
+            Console.WriteLine();
+            DisplayMessages.WriteInfo($"PRE-CACHE OPTIONS FOR: {table.Name}");
+
+            if (table.Type == "T" && table.RowCount > 0)
+            {
+                DisplayMessages.WriteHighlight($"Table has {table.RowCount:N0} rows");
+
+                // Estimate cache time and size
+                var estimatedPages = (int)Math.Ceiling((double)table.RowCount / 10000); // Assuming 10k page size
+                var estimatedTimeMinutes = estimatedPages * 0.1; // Rough estimate: 0.1 minutes per page
+
+                Console.WriteLine($"Estimated cache time: {estimatedTimeMinutes:F1} minutes");
+                Console.WriteLine($"Estimated pages: {estimatedPages:N0}");
+            }
+
+            Console.WriteLine();
+            DisplayMessages.WriteHighlight("Cache Options:");
+            Console.WriteLine("  1. Full Cache - Download all table data (recommended for searches)");
+            Console.WriteLine("  2. Metadata Only - Just table structure and column info");
+            Console.WriteLine("  3. Sample Cache - Download first few pages only (quick preview)");
+            Console.WriteLine();
+
+            while (true)
+            {
+                Console.Write("Select cache mode (1-3) [back/quit]: ");
+                string input = Console.ReadLine()?.Trim() ?? "";
+
+                if (input.Equals("quit", StringComparison.OrdinalIgnoreCase)) return "quit";
+                if (input.Equals("back", StringComparison.OrdinalIgnoreCase)) return "back";
+
+                switch (input)
+                {
+                    case "1":
+                        // Confirm full cache for large tables
+                        if (table.Type == "T" && table.RowCount > 100000)
+                        {
+                            Console.WriteLine();
+                            DisplayMessages.WriteWarning($"This table has {table.RowCount:N0} rows. Full caching may take several minutes.");
+                            Console.Write("Continue with full cache? [y/N]: ");
+                            string confirm = Console.ReadLine()?.Trim() ?? "";
+                            if (!confirm.Equals("y", StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+                        }
+                        DisplayMessages.WriteSuccess("Full cache mode selected.");
+                        return "FULL";
+
+                    case "2":
+                        DisplayMessages.WriteSuccess("Metadata only mode selected.");
+                        return "METADATA";
+
+                    case "3":
+                        DisplayMessages.WriteSuccess("Sample cache mode selected.");
+                        return "SAMPLE";
+
+                    default:
+                        DisplayMessages.WriteError("Invalid selection. Please choose 1, 2, or 3.");
+                        break;
+                }
+            }
+        }
+
         /// <summary>
         /// Displays table/view selection menu with caching and filtering
         /// </summary>
