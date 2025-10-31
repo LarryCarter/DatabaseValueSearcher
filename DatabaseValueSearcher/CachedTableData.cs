@@ -1,6 +1,4 @@
-﻿#nullable enable
-#pragma warning disable IDE0063 // Use simple 'using' statement
-using System;
+﻿using System;
 using System.Linq;
 
 namespace DatabaseValueSearcher
@@ -9,6 +7,7 @@ namespace DatabaseValueSearcher
     {
         public string Environment { get; set; } = string.Empty;
         public string Database { get; set; } = string.Empty;
+        public string SchemaName { get; set; } = "dbo";
         public string TableName { get; set; } = string.Empty;
         public List<ColumnInfo> Columns { get; set; } = new List<ColumnInfo>();
         public List<string> PrimaryKeys { get; set; } = new List<string>();

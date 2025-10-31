@@ -1,6 +1,4 @@
-﻿#nullable enable
-#pragma warning disable IDE0063 // Use simple 'using' statement
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Configuration;
 using System.Linq;
@@ -21,7 +19,7 @@ namespace DatabaseValueSearcher
         /// <summary>
         /// Gets string columns from a table's schema
         /// </summary>
-        public async Task<List<ColumnInfo>> GetStringColumnsAsync(SqlConnection conn, string tableName)
+        public async Task<List<ColumnInfo>> GetStringColumnsAsync(SqlConnection conn, string schemaName, string tableName)
         {
             var columns = new List<ColumnInfo>();
 
@@ -30,12 +28,14 @@ namespace DatabaseValueSearcher
                        ISNULL(CHARACTER_MAXIMUM_LENGTH, 0) as MaxLength,
                        IS_NULLABLE
                 FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_NAME = @TableName
+                WHERE TABLE_SCHEMA = @SchemaName
+                  AND TABLE_NAME = @TableName
                   AND DATA_TYPE IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
                 ORDER BY ORDINAL_POSITION";
 
             using var cmd = new SqlCommand(sql, conn);
             performanceManager.ConfigureCommand(cmd);
+            cmd.Parameters.AddWithValue("@SchemaName", schemaName);
             cmd.Parameters.AddWithValue("@TableName", tableName);
 
             using var reader = await cmd.ExecuteReaderAsync();
@@ -57,7 +57,7 @@ namespace DatabaseValueSearcher
         /// <summary>
         /// Gets primary key columns for a table
         /// </summary>
-        public async Task<List<string>> GetPrimaryKeyColumnsAsync(SqlConnection conn, string tableName)
+        public async Task<List<string>> GetPrimaryKeyColumnsAsync(SqlConnection conn, string schemaName, string tableName)
         {
             var primaryKeys = new List<string>();
 
@@ -65,6 +65,7 @@ namespace DatabaseValueSearcher
                 SELECT COLUMN_NAME
                 FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
                 WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+                  AND TABLE_SCHEMA = @SchemaName
                   AND TABLE_NAME = @TableName
                 ORDER BY ORDINAL_POSITION";
 
@@ -72,6 +73,7 @@ namespace DatabaseValueSearcher
             {
                 using var cmd = new SqlCommand(sql, conn);
                 performanceManager.ConfigureCommand(cmd);
+                cmd.Parameters.AddWithValue("@SchemaName", schemaName);
                 cmd.Parameters.AddWithValue("@TableName", tableName);
 
                 using var reader = await cmd.ExecuteReaderAsync();
@@ -131,7 +133,7 @@ namespace DatabaseValueSearcher
         }
 
         /// <summary>
-        /// Gets tables and views from a database with row counts
+        /// Gets tables and views from a database with row counts - ALL SCHEMAS
         /// </summary>
         public async Task<List<TableViewInfo>> GetTablesAndViewsAsync(string connectionString)
         {
@@ -143,9 +145,10 @@ namespace DatabaseValueSearcher
                 await conn.OpenAsync();
                 performanceManager.ConfigureConnection(conn);
 
-                // Simplified query that should work on all SQL Server versions
+                // Updated query to include ALL schemas, not just 'dbo'
                 string sql = @"
                     SELECT 
+                        t.TABLE_SCHEMA as SchemaName,
                         t.TABLE_NAME as Name,
                         t.TABLE_TYPE,
                         CASE 
@@ -155,8 +158,7 @@ namespace DatabaseValueSearcher
                         END as Type
                     FROM INFORMATION_SCHEMA.TABLES t
                     WHERE t.TABLE_TYPE IN ('BASE TABLE', 'VIEW')
-                      AND t.TABLE_SCHEMA = 'dbo'
-                    ORDER BY t.TABLE_TYPE, t.TABLE_NAME";
+                    ORDER BY t.TABLE_SCHEMA, t.TABLE_TYPE, t.TABLE_NAME";
 
                 using var cmd = new SqlCommand(sql, conn);
                 performanceManager.ConfigureCommand(cmd);
@@ -166,6 +168,7 @@ namespace DatabaseValueSearcher
                 {
                     var item = new TableViewInfo
                     {
+                        SchemaName = reader["SchemaName"]?.ToString() ?? "dbo",
                         Name = reader["Name"]?.ToString() ?? "",
                         Type = reader["Type"]?.ToString() ?? "O",
                         RowCount = 0 // We'll get row count separately for tables only
@@ -187,7 +190,7 @@ namespace DatabaseValueSearcher
                         await conn.OpenAsync();
                         performanceManager.ConfigureConnection(conn);
 
-                        string countSql = $"SELECT COUNT(*) FROM [{item.Name}]";
+                        string countSql = $"SELECT COUNT(*) FROM [{item.SchemaName}].[{item.Name}]";
                         using var cmd = new SqlCommand(countSql, conn);
                         performanceManager.ConfigureCommand(cmd);
 

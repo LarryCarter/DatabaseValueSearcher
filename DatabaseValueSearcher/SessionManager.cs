@@ -28,9 +28,13 @@ namespace DatabaseValueSearcher
 
         /// <summary>
         /// Initializes cache for a table session, loading from cache or database
+        /// Updated to handle schema names
         /// </summary>
         public async Task InitializeTableCache(SearchSession session)
         {
+            // Parse schema and table name from session.TableName
+            var (schemaName, tableName) = ParseSchemaAndTable(session.TableName);
+
             var cacheKey = cacheManager.GetCacheKey(session.Environment, session.Database, session.TableName);
             var cachedData = cacheManager.LoadMetadata(cacheKey);
 
@@ -57,16 +61,17 @@ namespace DatabaseValueSearcher
                     Environment = session.Environment,
                     Database = session.Database,
                     TableName = session.TableName,
+                    SchemaName = schemaName,
                     CachedAt = DateTime.Now,
                     PageSize = int.Parse(ConfigurationManager.AppSettings["PageSize"] ?? "10000")
                 };
 
-                // Get table structure
-                metadata.Columns = await databaseService.GetStringColumnsAsync(conn, session.TableName);
-                metadata.PrimaryKeys = await databaseService.GetPrimaryKeyColumnsAsync(conn, session.TableName);
+                // Get table structure - pass schema name
+                metadata.Columns = await databaseService.GetStringColumnsAsync(conn, schemaName, tableName);
+                metadata.PrimaryKeys = await databaseService.GetPrimaryKeyColumnsAsync(conn, schemaName, tableName);
 
-                // Get total row count
-                var countSql = $"SELECT COUNT(*) FROM [{session.TableName}]";
+                // Get total row count - use schema-qualified name
+                var countSql = $"SELECT COUNT(*) FROM [{schemaName}].[{tableName}]";
                 using var countCmd = new SqlCommand(countSql, conn);
                 performanceManager.ConfigureCommand(countCmd);
                 metadata.TotalRows = Convert.ToInt64(await countCmd.ExecuteScalarAsync());
@@ -111,13 +116,14 @@ namespace DatabaseValueSearcher
 
         /// <summary>
         /// Fetches a specific page from the database and caches it
-        /// </summary>
-        /// <summary>
-        /// Fetches a specific page from the database and caches it
+        /// Updated to handle schema-qualified names
         /// </summary>
         public async Task<DataPage?> FetchPageFromDatabase(SearchSession session, int pageNumber)
         {
             if (session.CachedData == null) return null;
+
+            // Parse schema and table name
+            var (schemaName, tableName) = ParseSchemaAndTable(session.TableName);
 
             var connectionString = DatabaseService.GetFullConnectionString(session.Environment, session.Database);
             var cacheKey = cacheManager.GetCacheKey(session.Environment, session.Database, session.TableName);
@@ -141,7 +147,7 @@ namespace DatabaseValueSearcher
                     var orderByColumns = string.Join(", ", session.CachedData.PrimaryKeys.Select(pk => $"[{pk}]"));
                     sql = $@"
                 SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))}
-                FROM [{session.TableName}]
+                FROM [{schemaName}].[{tableName}]
                 ORDER BY {orderByColumns}
                 OFFSET {offset} ROWS
                 FETCH NEXT {session.CachedData.PageSize} ROWS ONLY";
@@ -153,7 +159,7 @@ namespace DatabaseValueSearcher
                 WITH PagedData AS (
                     SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))},
                            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as RowNum
-                    FROM [{session.TableName}]
+                    FROM [{schemaName}].[{tableName}]
                 )
                 SELECT {string.Join(", ", allColumns.Select(c => $"[{c}]"))}
                 FROM PagedData
@@ -484,6 +490,19 @@ namespace DatabaseValueSearcher
             }
 
             return stats;
+        }
+
+        /// <summary>
+        /// Helper method to parse schema and table name from a potentially qualified name
+        /// </summary>
+        private (string schemaName, string tableName) ParseSchemaAndTable(string fullName)
+        {
+            if (fullName.Contains('.'))
+            {
+                var parts = fullName.Split('.');
+                return (parts[0], parts[1]);
+            }
+            return ("dbo", fullName);
         }
     }
 

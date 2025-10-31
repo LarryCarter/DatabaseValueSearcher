@@ -379,7 +379,7 @@ namespace DatabaseValueSearcher
         }
 
         /// <summary>
-        /// Displays formatted list of tables and views
+        /// Displays formatted list of tables and views grouped by schema
         /// </summary>
         public void DisplayTablesAndViews(List<TableViewInfo> tablesAndViews)
         {
@@ -387,37 +387,59 @@ namespace DatabaseValueSearcher
             DisplayMessages.WriteHighlight("(T = Table, V = View)");
             Console.WriteLine();
 
-            // Group by type for better display
-            var tables = tablesAndViews.Where(tv => tv.Type == "T").OrderBy(tv => tv.Name).ToList();
-            var views = tablesAndViews.Where(tv => tv.Type == "V").OrderBy(tv => tv.Name).ToList();
+            // Group by schema for better organization
+            var bySchema = tablesAndViews.GroupBy(tv => tv.SchemaName).OrderBy(g => g.Key);
 
             int counter = 1;
 
-            if (tables.Count > 0)
+            foreach (var schemaGroup in bySchema)
             {
-                DisplayMessages.WriteColoredInline("TABLES:", ConsoleColor.Green);
+                // Show schema header
+                DisplayMessages.WriteColoredInline($"SCHEMA: {schemaGroup.Key}", ConsoleColor.Magenta);
                 Console.WriteLine();
-                foreach (var table in tables)
-                {
-                    Console.Write($"  {counter}. ");
-                    DisplayMessages.WriteColoredInline("[T]", ConsoleColor.Green);
-                    Console.WriteLine($" {table.Name} ({table.RowCount:N0} rows)");
-                    counter++;
-                }
-                Console.WriteLine();
-            }
+                Console.WriteLine(new string('─', 60));
 
-            if (views.Count > 0)
-            {
-                DisplayMessages.WriteColoredInline("VIEWS:", ConsoleColor.Blue);
-                Console.WriteLine();
-                foreach (var view in views)
+                // Group by type within schema
+                var tables = schemaGroup.Where(tv => tv.Type == "T").OrderBy(tv => tv.Name).ToList();
+                var views = schemaGroup.Where(tv => tv.Type == "V").OrderBy(tv => tv.Name).ToList();
+
+                if (tables.Count > 0)
                 {
-                    Console.Write($"  {counter}. ");
-                    DisplayMessages.WriteColoredInline("[V]", ConsoleColor.Blue);
-                    Console.WriteLine($" {view.Name}");
-                    counter++;
+                    DisplayMessages.WriteColoredInline("  TABLES:", ConsoleColor.Green);
+                    Console.WriteLine();
+                    foreach (var table in tables)
+                    {
+                        Console.Write($"  {counter}. ");
+                        DisplayMessages.WriteColoredInline("[T]", ConsoleColor.Green);
+                        Console.Write($" {table.Name}");
+                        if (table.SchemaName != "dbo")
+                        {
+                            DisplayMessages.WriteColoredInline($" ({table.SchemaName})", ConsoleColor.DarkGray);
+                        }
+                        Console.WriteLine($" ({table.RowCount:N0} rows)");
+                        counter++;
+                    }
                 }
+
+                if (views.Count > 0)
+                {
+                    Console.WriteLine();
+                    DisplayMessages.WriteColoredInline("  VIEWS:", ConsoleColor.Blue);
+                    Console.WriteLine();
+                    foreach (var view in views)
+                    {
+                        Console.Write($"  {counter}. ");
+                        DisplayMessages.WriteColoredInline("[V]", ConsoleColor.Blue);
+                        Console.Write($" {view.Name}");
+                        if (view.SchemaName != "dbo")
+                        {
+                            DisplayMessages.WriteColoredInline($" ({view.SchemaName})", ConsoleColor.DarkGray);
+                        }
+                        Console.WriteLine();
+                        counter++;
+                    }
+                }
+
                 Console.WriteLine();
             }
         }
